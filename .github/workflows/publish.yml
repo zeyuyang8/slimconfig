@@ -1,0 +1,45 @@
+# Publish to PyPI on a version tag, via trusted publishing (OIDC) — no API token is stored here.
+#
+# One-time setup on PyPI (https://pypi.org/manage/account/publishing/), before the first tag:
+#   PyPI project name: slimconfig | Owner: zeyuyang8 | Repository: slimconfig
+#   Workflow: publish.yml       | Environment: pypi
+# Then release with:
+#   git tag v0.1.0 && git push origin v0.1.0
+# The tag must match slimconfig.__version__ (the build reads the version from there) — the check
+# job below fails the release if they disagree.
+
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Tag matches slimconfig.__version__
+        run: |
+          version=$(grep -oP '__version__ = "\K[^"]+' src/slimconfig/__init__.py)
+          tag="${GITHUB_REF_NAME#v}"
+          test "$version" = "$tag" || { echo "tag $tag != __version__ $version"; exit 1; }
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # mint the OIDC token PyPI trusted publishing verifies
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
