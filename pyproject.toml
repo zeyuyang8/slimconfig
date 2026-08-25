@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slimconfig"
+# One source of truth: slimconfig.__version__ (see [tool.setuptools.dynamic] below).
+dynamic = ["version"]
+description = "YAML configs onto typed dataclass schemas — a lightweight Hydra stand-in"
+readme = "README.md"
+license = {text = "MIT"}
+# 3.12+: the loader uses PEP 695 syntax (`type Spec = ...`, `def load_config[T]`).
+requires-python = ">=3.12"
+dependencies = [
+    # Pinned below 2.4: 2.4.0.dev deprecates register_new_resolver, which config.py uses for the
+    # ${now:...} / ${from_yaml:...} resolvers — a stable 2.3.x keeps that API warning-free.
+    "omegaconf>=2.3,<2.4",
+    "pyyaml",
+]
+authors = [
+    {name = "Zeyu Yang"},
+]
+keywords = ["config", "yaml", "omegaconf", "dataclass", "hydra"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.urls]
+Homepage = "https://github.com/zeyuyang8/slimconfig"
+Repository = "https://github.com/zeyuyang8/slimconfig"
+
+[tool.setuptools.dynamic]
+version = {attr = "slimconfig.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["slimconfig*"]
+
+[tool.setuptools.package-data]
+slimconfig = ["py.typed"]
+
+[tool.ruff]
+line-length = 150
+
+[tool.ruff.lint]
+extend-ignore = ["E203"]
+
+[tool.ruff.lint.per-file-ignores]
+# Every config problem is reported as ValueError, including the isinstance guards (TRY004 wants
+# TypeError there); the ${now:...} stamp is intentionally local time (DTZ005).
+"src/slimconfig/config.py" = ["TRY004", "DTZ005"]
