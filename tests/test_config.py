@@ -141,6 +141,16 @@ def test_from_yaml_resolver_reads_another_config(tmp_path, monkeypatch):
     assert load_mapping_yaml(path).tag == "wikitext"
 
 
+def test_from_yaml_resolver_follows_the_referenced_files_defaults(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    write(tmp_path / "base_limits.yaml", "admit: 4\n")
+    write(tmp_path / "limits.yaml", "defaults:\n  - base_limits.yaml\nadmit: 32\n")
+    # The referenced file is read through load_mapping_yaml, so it composes first and its own value
+    # wins over the default it pulls in — the resolver sees 32, not 4.
+    path = write(tmp_path / "a.yaml", "concurrency: ${from_yaml:limits.yaml,admit}\n")
+    assert load_mapping_yaml(path).concurrency == 32
+
+
 def test_from_yaml_resolver_rejects_a_missing_key(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     write(tmp_path / "data.yaml", "dataset:\n  name: wikitext\n")
