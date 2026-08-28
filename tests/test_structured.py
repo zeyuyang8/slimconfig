@@ -1,14 +1,13 @@
-# The typed layer: merge_specs / load_config / peek, plus start_run and dispatch.
+# The typed layer: merge_specs / load_config / peek. The run layer lives in test_runs.py.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 
 import pytest
-from omegaconf import MISSING, OmegaConf
+from omegaconf import MISSING
 
-from slimconfig import dispatch, load_config, merge_specs, peek, start_run
+from slimconfig import load_config, merge_specs, peek
 
 
 @dataclass
@@ -114,85 +113,3 @@ def test_peek_reads_a_top_level_key_without_validation(tmp_path):
     assert peek([path], "mode") == "train"
     assert peek([path], "absent") is None
     assert peek([path, "mode=eval"], "mode") == "eval"
-
-
-# ── start_run ────────────────────────────────────────────────────────────────
-
-
-def test_start_run_writes_a_resolved_snapshot_and_meta(tmp_path):
-    spec = write(tmp_path / "a.yaml", FULL)
-    run_dir = start_run(str(tmp_path / "runs" / "demo"), [spec])
-    snapshot = OmegaConf.load(f"{run_dir}/config.yaml")
-    assert snapshot.model == "llama"
-    meta = json.loads((tmp_path / "runs" / "demo" / "run_meta.json").read_text())
-    assert {"argv", "cwd", "started", "host"} <= meta.keys()
-
-
-def test_start_run_snapshot_is_rerunnable_in_place(tmp_path):
-    # Re-running a run from its own snapshot passes the very file start_run overwrites.
-    spec = write(tmp_path / "a.yaml", FULL)
-    run_dir = start_run(str(tmp_path / "run"), [spec])
-    snapshot = f"{run_dir}/config.yaml"
-    start_run(run_dir, [snapshot])
-    assert load_config(TrainConfig, [snapshot]).model == "llama"
-
-
-def test_start_run_accepts_a_dataclass_instance(tmp_path):
-    cfg = load_config(TrainConfig, [write(tmp_path / "a.yaml", FULL)])
-    run_dir = start_run(str(tmp_path / "run"), cfg)
-    assert OmegaConf.load(f"{run_dir}/config.yaml").optim.warmup_steps == 100
-
-
-def test_start_run_survives_an_unsnapshottable_config(tmp_path, capsys):
-    start_run(str(tmp_path / "run"), object())  # provenance never aborts a run
-    assert "could not snapshot" in capsys.readouterr().out
-    assert (tmp_path / "run").is_dir()
-
-
-# ── dispatch ─────────────────────────────────────────────────────────────────
-
-
-# A schema reached through dispatch declares `mode` itself — the key is part of the config, and
-# unknown keys are rejected.
-@dataclass
-class JobConfig:
-    mode: str = MISSING
-    run_dir: str = MISSING
-    model: str = MISSING
-
-
-def test_dispatch_loads_the_schema_for_a_tuple_entry(tmp_path):
-    seen = {}
-
-    def train(cfg: JobConfig) -> int:
-        seen["model"] = cfg.model
-        return 0
-
-    path = write(tmp_path / "a.yaml", f"mode: train\nrun_dir: {tmp_path / 'run'}\nmodel: llama\n")
-    assert dispatch({"train": (JobConfig, train)}, [path]) == 0
-    assert seen["model"] == "llama"
-    assert (tmp_path / "run" / "config.yaml").is_file()
-
-
-def test_dispatch_passes_raw_specs_to_a_bare_handler(tmp_path):
-    seen = {}
-
-    def sweep(specs) -> int:
-        seen["specs"] = specs
-        return 3
-
-    path = write(tmp_path / "a.yaml", f"mode: sweep\nrun_dir: {tmp_path / 'run'}\n")
-    assert dispatch({"sweep": sweep}, [path]) == 3
-    assert seen["specs"] == [path]
-
-
-def test_dispatch_rejects_an_unknown_mode(tmp_path):
-    path = write(tmp_path / "a.yaml", "mode: nope\nrun_dir: runs/x\n")
-    with pytest.raises(SystemExit, match="must set `mode` to one of train"):
-        dispatch({"train": (TrainConfig, lambda cfg: 0)}, [path])
-
-
-def test_dispatch_requires_a_run_dir(tmp_path):
-    path = write(tmp_path / "a.yaml", "mode: train\n")
-    with pytest.raises(SystemExit, match="must set `run_dir`"):
-        dispatch({"train": (TrainConfig, lambda cfg: 0)}, [path])

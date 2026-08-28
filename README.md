@@ -11,7 +11,7 @@ Two rules, enforced at load time:
 * **Unknown keys are rejected.** A typo in a YAML key is an error, not a value that goes nowhere.
 
 Plus what a research/experiment runner actually needs: Hydra-style `defaults:` composition, a
-`mode` dispatcher, and a run folder that snapshots the exact config it ran with.
+`mode` dispatcher, and a run folder — holding the config, the log, and the results of one run.
 
 ## Install
 
@@ -85,10 +85,56 @@ On top of OmegaConf's own `${a.b}` interpolation, importing slimconfig registers
 | `${now:%Y%m%d-%H%M%S}` | the load time, `strftime`-formatted — one consistent stamp per process |
 | `${from_yaml:configs/data.yaml,dataset.name}` | one value read out of *another* config, so a config can track a value another file owns without duplicating it |
 
+## Run a function
+
+`@run(Schema)` makes a function the entry point of a run: it is called with the config named on the
+command line, and the folder that config's `run_dir` points at is created, snapshotted, and logged
+into around the call.
+
+```python
+# train.py
+from slimconfig import run
+
+@run(TrainConfig)
+def main(cfg: TrainConfig) -> int:
+    print(f"training {cfg.model}")             # printed here -> also in <run_dir>/main.log
+    torch.save(state, f"{cfg.run_dir}/model.pt")   # results go in the same folder
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())                   # specs default to sys.argv[1:]
+```
+
+```bash
+python train.py configs/train.yaml optim.lr=1e-4
+```
+
+```
+runs/20260828-114500/     # whatever run_dir says
+├── config.yaml           # the exact resolved config — re-run with `python train.py <this>`
+├── run_meta.json         # argv, cwd, git commit + dirty flag, start time, host
+├── main.log              # everything the run printed
+└── model.pt              # …and whatever the function wrote there
+```
+
+`main(["configs/train.yaml", "optim.lr=1e-4"])` calls the same entry point from Python. Options:
+
+| | |
+| --- | --- |
+| `@run(Schema)` | call the function with a loaded `Schema` instance |
+| `@run` (bare) | call it with the raw specs — for an entry point that picks its schema off another key and loads its own config |
+| `@run(Schema, log="train.log")` | name the log file (`{name}` stands for the function's name; the default is `"{name}.log"`) |
+| `@run(Schema, log=None)` | no log file, just the snapshot |
+
+The log captures **stdout only** — progress bars go to stderr, and 45 KB of progress bars is not a
+log — appends (a resumed run adds to the folder's history, under a banner naming the invocation),
+and tees, so output still reaches the terminal. Child processes hold the real fd 1 and are not
+captured.
+
 ## Dispatch on `mode`
 
 For a single entry point that fans out to several jobs, `dispatch` reads `mode`, opens and
-snapshots `run_dir`, then calls the matching handler:
+snapshots `run_dir` (logging to `<mode>.log`), then calls the matching handler:
 
 ```python
 # run.py
@@ -108,10 +154,19 @@ raise SystemExit(dispatch(MODES, sys.argv[1:]))
 
 ## Run folders
 
-`start_run(run_dir, config)` (called for you by `dispatch`) creates the folder and writes:
+`@run` and `dispatch` open the folder for you. The pieces are also usable on their own, for a
+routine that opens a folder the config does not name — one cell of a sweep, say:
 
-* `config.yaml` — the fully-resolved config, re-runnable as-is: `python run.py <run_dir>/config.yaml`
-* `run_meta.json` — argv, cwd, git commit + dirty flag, start time, host
+```python
+from slimconfig import open_run, start_run, tee_stdout
+
+with open_run(cfg, log="eval.log"):       # snapshot + log, run_dir read off cfg
+    ...
+
+start_run(cell_dir, cell_cfg)             # just the snapshot, into a folder you chose
+with tee_stdout(f"{cell_dir}/eval.log"):  # just the log
+    ...
+```
 
 Everything a run produces goes in that same folder, so a result is never separated from the config
 that made it. The snapshot is best-effort — provenance never aborts a run.
@@ -120,11 +175,14 @@ that made it. The snapshot is best-effort — provenance never aborts a run.
 
 | | |
 | --- | --- |
+| `@run(schema, log=...)` | make a function the entry point of a run: load, open the folder, log, call |
 | `load_config(schema, specs)` | merge specs onto a dataclass schema → a populated instance |
 | `merge_specs(specs)` | merge specs into one unvalidated `DictConfig` |
 | `peek(specs, key)` | read one top-level key before choosing a schema |
-| `dispatch(modes, specs)` | `mode` → handler, with the run folder opened and snapshotted |
+| `dispatch(modes, specs)` | `mode` → handler, with the run folder opened, snapshotted, and logged |
+| `open_run(config, log=...)` | context manager: create the folder `config` names, snapshot it, tee the log |
 | `start_run(run_dir, config)` | create the run folder, write `config.yaml` + `run_meta.json` |
+| `tee_stdout(path, banner=None)` | context manager: also append stdout to `path` |
 | `load_mapping_yaml(path)` | one YAML → `DictConfig`, with `defaults:` composed |
 | `load_yaml(path)` | one YAML → `dict`, plain PyYAML, no composition |
 
