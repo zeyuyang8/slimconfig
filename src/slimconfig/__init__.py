@@ -2,11 +2,11 @@
 #
 #     from slimconfig import run
 #
-#     @run(MyConfig)                              # MyConfig: a dataclass of MISSING fields, one of
-#     def main(cfg: MyConfig) -> int:             # which is `run_dir`
-#         ...                                     # results go under cfg.run_dir
+#     def main(cfg: MyConfig) -> int:             # MyConfig: a dataclass of MISSING fields, two of
+#         ...                                     # which are `run_dir` (results go under it) and `log`
 #
-#     raise SystemExit(main())                    # python main.py configs/my.yaml
+#     if __name__ == "__main__":                  # python main.py configs/my.yaml
+#         run(main)
 #
 # See config.py for the YAML loader + `defaults:` composition and the ${now:...} / ${from_yaml:...}
 # resolvers, structured.py for the typed, all-fields-required schema loader, runs.py for the run folder
@@ -16,8 +16,7 @@
 from .config import load_mapping_yaml, load_yaml
 from .paths import project_root, resolve_path
 from .runs import (
-    dispatch,
-    open_run,
+    RUN_FIELDS,
     run,
     start_run,
     tee_stdout,
@@ -29,16 +28,15 @@ from .structured import (
     peek,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.5.0"
 
 __all__ = [
+    "RUN_FIELDS",
     "Spec",
-    "dispatch",
     "load_config",
     "load_mapping_yaml",
     "load_yaml",
     "merge_specs",
-    "open_run",
     "peek",
     "project_root",
     "resolve_path",

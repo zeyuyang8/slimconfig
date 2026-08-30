@@ -1,4 +1,4 @@
-# The run layer: start_run / tee_stdout / open_run, the @run entry-point decorator, and dispatch.
+# The run layer: start_run / tee_stdout, and the `run` launcher every script's __main__ is.
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 import pytest
 from omegaconf import MISSING, OmegaConf
 
-from slimconfig import dispatch, load_config, open_run, run, start_run, tee_stdout
+from slimconfig import load_config, run, start_run, tee_stdout
 
 
 @dataclass
@@ -20,14 +20,28 @@ class Optim:
 @dataclass
 class TrainConfig:
     run_dir: str = MISSING
+    log: str | None = MISSING
     model: str = MISSING
     tags: list[str] = MISSING
     resume_from: str | None = MISSING
     optim: Optim = field(default_factory=Optim)
 
 
+# The two ways a schema can fail the launcher's one requirement.
+@dataclass
+class NoFolderConfig:
+    model: str = MISSING
+
+
+@dataclass
+class NoLogConfig:
+    run_dir: str = MISSING
+    model: str = MISSING
+
+
 FULL = """
 run_dir: runs/demo
+log: null
 model: llama
 tags: []
 resume_from: null
@@ -46,20 +60,19 @@ def write(path, text: str) -> str:
 
 
 def test_start_run_writes_a_resolved_snapshot_and_meta(tmp_path):
-    spec = write(tmp_path / "a.yaml", FULL)
-    run_dir = start_run(str(tmp_path / "runs" / "demo"), [spec])
+    cfg = load_config(TrainConfig, [write(tmp_path / "a.yaml", FULL)])
+    run_dir = start_run(str(tmp_path / "runs" / "demo"), cfg)
     snapshot = OmegaConf.load(f"{run_dir}/config.yaml")
     assert snapshot.model == "llama"
-    meta = json.loads((tmp_path / "runs" / "demo" / "run_meta.json").read_text())
+    meta = json.loads((tmp_path / "runs" / "demo" / "metadata.json").read_text())
     assert {"argv", "cwd", "started", "host"} <= meta.keys()
 
 
 def test_start_run_snapshot_is_rerunnable_in_place(tmp_path):
     # Re-running a run from its own snapshot passes the very file start_run overwrites.
-    spec = write(tmp_path / "a.yaml", FULL)
-    run_dir = start_run(str(tmp_path / "run"), [spec])
+    run_dir = start_run(str(tmp_path / "run"), load_config(TrainConfig, [write(tmp_path / "a.yaml", FULL)]))
     snapshot = f"{run_dir}/config.yaml"
-    start_run(run_dir, [snapshot])
+    start_run(run_dir, load_config(TrainConfig, [snapshot]))
     assert load_config(TrainConfig, [snapshot]).model == "llama"
 
 
@@ -106,160 +119,149 @@ def test_tee_stdout_is_undone_after_an_exception(tmp_path, capsys):
     assert (tmp_path / "run.log").read_text() == "before the boom\n"
 
 
-# ── open_run ─────────────────────────────────────────────────────────────────
+# ── run ──────────────────────────────────────────────────────────────────────
 
 
-def test_open_run_snapshots_and_logs(tmp_path):
-    run_dir = str(tmp_path / "run")
-    with open_run([{"run_dir": run_dir, "model": "llama"}], log="job.log") as opened:
-        print("working")
-    assert opened == run_dir
-    assert (tmp_path / "run" / "config.yaml").is_file()
-    assert "working" in (tmp_path / "run" / "job.log").read_text()
+# `run` is a process boundary: it exits with the status the function returned. Every test below launches
+# it the way a shell would — the specs on the command line — and reads that status back off the
+# SystemExit, which is what the shell would see.
+def launch(monkeypatch, specs, function, *args, **overrides) -> object:
+    monkeypatch.setattr("sys.argv", ["train.py", *specs])
+    with pytest.raises(SystemExit) as exit_info:
+        run(function, *args, **overrides)
+    return exit_info.value.code
 
 
-def test_open_run_without_a_log(tmp_path):
-    with open_run([{"run_dir": str(tmp_path / "run")}], log=None):
-        print("working")
-    assert (tmp_path / "run" / "config.yaml").is_file()
-    assert list((tmp_path / "run").glob("*.log")) == []
-
-
-def test_open_run_requires_a_run_dir():
-    with pytest.raises(SystemExit, match="must set `run_dir`"), open_run([{"model": "llama"}]):
-        pass
-
-
-def test_open_run_reads_run_dir_off_a_loaded_config(tmp_path):
-    cfg = load_config(TrainConfig, [write(tmp_path / "a.yaml", FULL), f"run_dir={tmp_path / 'run'}"])
-    with open_run(cfg, log=None) as run_dir:
-        pass
-    assert run_dir == str(tmp_path / "run")
-    assert OmegaConf.load(f"{run_dir}/config.yaml").model == "llama"
-
-
-# ── @run ─────────────────────────────────────────────────────────────────────
-
-
-def test_run_loads_the_config_and_opens_the_folder(tmp_path):
-    @run(TrainConfig)
+def test_run_loads_the_config_and_opens_the_folder(tmp_path, monkeypatch):
     def train(cfg: TrainConfig) -> int:
         print(f"training {cfg.model}")
         (tmp_path / "run" / "result.txt").write_text(cfg.model)  # results land in the run folder
         return 0
 
-    path = write(tmp_path / "a.yaml", FULL)
-    assert train([path, f"run_dir={tmp_path / 'run'}"]) == 0
+    specs = [write(tmp_path / "a.yaml", FULL), f"run_dir={tmp_path / 'run'}", "log=train.log"]
+    assert launch(monkeypatch, specs, train) == 0
     assert (tmp_path / "run" / "config.yaml").is_file()
-    assert (tmp_path / "run" / "run_meta.json").is_file()
+    assert (tmp_path / "run" / "metadata.json").is_file()
     assert (tmp_path / "run" / "result.txt").read_text() == "llama"
     assert "training llama" in (tmp_path / "run" / "train.log").read_text()
 
 
-def test_run_defaults_its_specs_to_argv(tmp_path, monkeypatch):
-    @run(TrainConfig)
-    def train(cfg: TrainConfig) -> str:
-        return cfg.model
+def test_run_exits_zero_when_the_function_returns_nothing(tmp_path, monkeypatch):
+    def train(cfg: TrainConfig) -> None:
+        return None
+
+    specs = [write(tmp_path / "a.yaml", FULL), f"run_dir={tmp_path / 'run'}"]
+    assert launch(monkeypatch, specs, train) is None
+
+
+def test_run_takes_its_specs_from_the_command_line(tmp_path, monkeypatch):
+    def train(cfg: TrainConfig) -> int:
+        return 0 if cfg.model == "qwen" else 1
+
+    specs = [write(tmp_path / "a.yaml", FULL), f"run_dir={tmp_path / 'run'}", "model=qwen"]
+    assert launch(monkeypatch, specs, train) == 0
+
+
+def test_run_takes_a_config_path_and_overrides_from_the_caller(tmp_path, monkeypatch):
+    def train(cfg: TrainConfig) -> int:
+        return 0 if (cfg.model, cfg.optim.lr) == ("qwen", 0.5) else 1
 
     path = write(tmp_path / "a.yaml", FULL)
-    monkeypatch.setattr("sys.argv", ["train.py", path, f"run_dir={tmp_path / 'run'}", "model=qwen"])
-    assert train() == "qwen"
+    # The command line is ignored when the caller names the config itself.
+    code = launch(
+        monkeypatch, ["ignored.yaml"], train, path,
+        **{"model": "qwen", "optim.lr": 0.5, "run_dir": str(tmp_path / "run")},
+    )
+    assert code == 0
+    assert (tmp_path / "run" / "config.yaml").is_file()
 
 
-def test_run_names_the_log_and_can_turn_it_off(tmp_path):
-    @run(TrainConfig, log="quality.log")
-    def named(cfg: TrainConfig) -> None:
-        print("named")
-
-    @run(TrainConfig, log=None)
-    def quiet(cfg: TrainConfig) -> None:
-        print("quiet")
-
-    path = write(tmp_path / "a.yaml", FULL)
-    named([path, f"run_dir={tmp_path / 'run'}"])
-    quiet([path, f"run_dir={tmp_path / 'run'}"])
-    assert (tmp_path / "run" / "quality.log").is_file()
-    assert sorted(p.name for p in (tmp_path / "run").glob("*.log")) == ["quality.log"]
-
-
-def test_run_bare_hands_the_raw_specs_over(tmp_path):
-    seen = {}
-
-    @run
-    def sweep(specs) -> int:
-        seen["specs"] = specs  # a handler whose schema depends on another field loads its own
-        return 3
-
-    path = write(tmp_path / "a.yaml", f"run_dir: {tmp_path / 'run'}\n")
-    assert sweep([path]) == 3
-    assert seen["specs"] == [path]
-    assert (tmp_path / "run" / "sweep.log").is_file()
-
-
-def test_run_requires_a_run_dir(tmp_path):
-    @run(TrainConfig)
+def test_run_reports_usage_when_given_no_config(monkeypatch):
     def train(cfg: TrainConfig) -> int:
         raise AssertionError("must not run")
 
-    path = write(tmp_path / "a.yaml", FULL.replace("run_dir: runs/demo\n", ""))
-    with pytest.raises(SystemExit, match="must set `run_dir`"):
-        train([path])
+    assert "usage: train.py <config.yaml>" in str(launch(monkeypatch, [], train))
 
 
-def test_run_keeps_the_wrapped_function_identifiable():
-    @run(TrainConfig)
+def test_run_writes_the_log_the_config_names_and_nothing_when_it_is_null(tmp_path, monkeypatch):
+    def loud(cfg: TrainConfig) -> None:
+        print("named")
+
+    def quiet(cfg: TrainConfig) -> None:
+        print("quiet")
+
+    specs = [write(tmp_path / "a.yaml", FULL), f"run_dir={tmp_path / 'run'}"]
+    launch(monkeypatch, [*specs, "log=quality.log"], loud)
+    launch(monkeypatch, [*specs, "log=null"], quiet)
+    assert "named" in (tmp_path / "run" / "quality.log").read_text()
+    assert sorted(p.name for p in (tmp_path / "run").glob("*.log")) == ["quality.log"]
+
+
+def test_run_puts_the_log_where_the_config_asks(tmp_path, monkeypatch):
     def train(cfg: TrainConfig) -> None:
-        """Docstring kept."""
+        print("nested")
 
-    assert (train.__name__, train.__doc__) == ("train", "Docstring kept.")
-
-
-# ── dispatch ─────────────────────────────────────────────────────────────────
-
-
-# A schema reached through dispatch declares `mode` itself — the key is part of the config, and
-# unknown keys are rejected.
-@dataclass
-class JobConfig:
-    mode: str = MISSING
-    run_dir: str = MISSING
-    model: str = MISSING
+    specs = [write(tmp_path / "a.yaml", FULL), f"run_dir={tmp_path / 'run'}", "log=logs/train.log"]
+    launch(monkeypatch, specs, train)
+    assert "nested" in (tmp_path / "run" / "logs" / "train.log").read_text()
 
 
-def test_dispatch_loads_the_schema_for_a_tuple_entry(tmp_path):
+def test_run_requires_a_folder_to_write_in(tmp_path, monkeypatch):
+    def train(cfg: TrainConfig) -> int:
+        raise AssertionError("must not run")
+
+    specs = [write(tmp_path / "a.yaml", FULL.replace("run_dir: runs/demo", "run_dir: ''"))]
+    assert "nowhere to write" in str(launch(monkeypatch, specs, train))
+
+
+# ── run: the function IS its config ──────────────────────────────────────────
+
+
+def test_run_takes_the_schema_off_the_function_s_annotation(tmp_path, monkeypatch):
     seen = {}
 
-    def train(cfg: JobConfig) -> int:
-        seen["model"] = cfg.model
-        print("trained")
+    def train(cfg: TrainConfig) -> int:
+        seen["type"] = type(cfg).__name__
+        seen["lr"] = cfg.optim.lr
         return 0
 
-    path = write(tmp_path / "a.yaml", f"mode: train\nrun_dir: {tmp_path / 'run'}\nmodel: llama\n")
-    assert dispatch({"train": (JobConfig, train)}, [path]) == 0
-    assert seen["model"] == "llama"
-    assert (tmp_path / "run" / "config.yaml").is_file()
-    assert "trained" in (tmp_path / "run" / "train.log").read_text()  # log named after the mode
+    specs = [write(tmp_path / "a.yaml", FULL), f"run_dir={tmp_path / 'run'}"]
+    assert launch(monkeypatch, specs, train) == 0
+    assert seen == {"type": "TrainConfig", "lr": 0.0002}  # loaded, typed, not a mapping of strings
 
 
-def test_dispatch_passes_raw_specs_to_a_bare_handler(tmp_path):
-    seen = {}
-
-    def sweep(specs) -> int:
-        seen["specs"] = specs
-        return 3
-
-    path = write(tmp_path / "a.yaml", f"mode: sweep\nrun_dir: {tmp_path / 'run'}\n")
-    assert dispatch({"sweep": sweep}, [path]) == 3
-    assert seen["specs"] == [path]
+def test_run_rejects_a_function_that_is_not_one_of():
+    with pytest.raises(TypeError, match="function of one config argument"):
+        run("train")
 
 
-def test_dispatch_rejects_an_unknown_mode(tmp_path):
-    path = write(tmp_path / "a.yaml", "mode: nope\nrun_dir: runs/x\n")
-    with pytest.raises(SystemExit, match="must set `mode` to one of train"):
-        dispatch({"train": (TrainConfig, lambda cfg: 0)}, [path])
+def test_run_rejects_a_function_of_the_wrong_arity():
+    def train(cfg: TrainConfig, extra: int) -> int:
+        return 0
+
+    with pytest.raises(TypeError, match="exactly one argument"):
+        run(train)
 
 
-def test_dispatch_requires_a_run_dir(tmp_path):
-    path = write(tmp_path / "a.yaml", "mode: train\n")
-    with pytest.raises(SystemExit, match="must set `run_dir`"):
-        dispatch({"train": (TrainConfig, lambda cfg: 0)}, [path])
+def test_run_rejects_an_unannotated_function():
+    def train(cfg) -> int:
+        return 0
+
+    with pytest.raises(TypeError, match="must be annotated with its config class"):
+        run(train)
+
+
+def test_run_rejects_a_config_class_without_a_run_dir_or_a_log():
+    def train(cfg: NoFolderConfig) -> int:
+        return 0
+
+    with pytest.raises(TypeError, match="missing `run_dir` and `log`"):
+        run(train)
+
+
+def test_run_rejects_a_config_class_without_a_log():
+    def train(cfg: NoLogConfig) -> int:
+        return 0
+
+    with pytest.raises(TypeError, match="missing `log`"):
+        run(train)

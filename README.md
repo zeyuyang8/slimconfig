@@ -10,8 +10,8 @@ Two rules, enforced at load time:
   collection as `[]`. Nothing is silently inherited.
 * **Unknown keys are rejected.** A typo in a YAML key is an error, not a value that goes nowhere.
 
-Plus what a research/experiment runner actually needs: Hydra-style `defaults:` composition, a
-`mode` dispatcher, and a run folder — holding the config, the log, and the results of one run.
+Plus what a research/experiment runner actually needs: Hydra-style `defaults:` composition, one
+launcher, and a run folder — holding the config, the log, and the results of one run.
 
 ## Install
 
@@ -36,6 +36,7 @@ class Optim:
 @dataclass
 class TrainConfig:
     run_dir: str = MISSING
+    log: str | None = MISSING
     model: str = MISSING
     optim: Optim = field(default_factory=Optim)
     resume_from: str | None = MISSING   # "off" must still be spelled `null`
@@ -47,6 +48,7 @@ print(cfg.optim.lr)
 ```yaml
 # configs/train.yaml
 run_dir: runs/${now:%Y%m%d-%H%M%S}
+log: train.log
 model: llama-3-8b
 optim:
   lr: 2.0e-4
@@ -87,22 +89,22 @@ On top of OmegaConf's own `${a.b}` interpolation, importing slimconfig registers
 
 ## Run a function
 
-`@run(Schema)` makes a function the entry point of a run: it is called with the config named on the
-command line, and the folder that config's `run_dir` points at is created, snapshotted, and logged
-into around the call.
+A run is a config plus the function that consumes it, and `run` is where a script hands over both —
+and nothing else. It loads the config, creates and snapshots the run's folder, tees stdout into it,
+calls the function, and exits with its status, so a script's `__main__` is one line with no argv
+handling and no `SystemExit` of its own.
 
 ```python
 # train.py
 from slimconfig import run
 
-@run(TrainConfig)
 def main(cfg: TrainConfig) -> int:
-    print(f"training {cfg.model}")             # printed here -> also in <run_dir>/main.log
+    print(f"training {cfg.model}")             # printed here -> also in <run_dir>/<cfg.log>
     torch.save(state, f"{cfg.run_dir}/model.pt")   # results go in the same folder
     return 0
 
 if __name__ == "__main__":
-    raise SystemExit(main())                   # specs default to sys.argv[1:]
+    run(main)
 ```
 
 ```bash
@@ -112,56 +114,60 @@ python train.py configs/train.yaml optim.lr=1e-4
 ```
 runs/20260828-114500/     # whatever run_dir says
 ├── config.yaml           # the exact resolved config — re-run with `python train.py <this>`
-├── run_meta.json         # argv, cwd, git commit + dirty flag, start time, host
-├── main.log              # everything the run printed
+├── metadata.json         # argv, cwd, git commit + dirty flag, start time, host
+├── train.log             # everything the run printed — whatever log says
 └── model.pt              # …and whatever the function wrote there
 ```
 
-`main(["configs/train.yaml", "optim.lr=1e-4"])` calls the same entry point from Python. Options:
+`run` takes **two** things:
 
-| | |
+| Input | What it is |
 | --- | --- |
-| `@run(Schema)` | call the function with a loaded `Schema` instance |
-| `@run` (bare) | call it with the raw specs — for an entry point that picks its schema off another key and loads its own config |
-| `@run(Schema, log="train.log")` | name the log file (`{name}` stands for the function's name; the default is `"{name}.log"`) |
-| `@run(Schema, log=None)` | no log file, just the snapshot |
+| `function` | the routine to run. It takes exactly **one argument, annotated with its config class**, and returns this process's exit status (`None` → 0). The function *is* its config: `run` reads the schema off that annotation, so there is nothing else to name. |
+| `config` | the YAML file to load it from. Omitted, it comes off the command line (`<config.yaml> [key=value ...]`) — the usual way a script is launched. |
+
+The config class must declare two fields, and they are the only thing `run` needs beyond the
+function: **`run_dir`**, the folder this run owns, and **`log`**, the log file inside it (`null` for
+no log — a distributed launch, say, where every rank would append to one file). A schema missing
+either is rejected at launch, by name.
+
+Keyword arguments are `key=value` overrides on top, the same ones the command line takes:
+
+```python
+run(main, "configs/train.yaml", **{"optim.lr": 1e-4})
+```
 
 The log captures **stdout only** — progress bars go to stderr, and 45 KB of progress bars is not a
 log — appends (a resumed run adds to the folder's history, under a banner naming the invocation),
 and tees, so output still reaches the terminal. Child processes hold the real fd 1 and are not
 captured.
 
-## Dispatch on `mode`
+## One job per entry point
 
-For a single entry point that fans out to several jobs, `dispatch` reads `mode`, opens and
-snapshots `run_dir` (logging to `<mode>.log`), then calls the matching handler:
+There is no mode switch and no dispatch table: an entry point is one function, and a script that
+runs several kinds of job is several scripts. Each is three lines, and each says in its own name
+which routine it is.
 
 ```python
-# run.py
-import sys
-from slimconfig import dispatch
+# train.py                          # eval.py
+from slimconfig import run          from slimconfig import run
+from jobs import train              from jobs import evaluate
 
-MODES = {
-    "train": (TrainConfig, train),      # load TrainConfig strictly, call train(cfg)
-    "eval": (EvalConfig, evaluate),
-    "sweep": run_sweep,                 # bare handler: gets the raw specs, loads its own schema
-}
-raise SystemExit(dispatch(MODES, sys.argv[1:]))
+if __name__ == "__main__":          if __name__ == "__main__":
+    run(train)                          run(evaluate)
 ```
 
-`mode` and `run_dir` are ordinary config keys, so a schema loaded this way declares them itself
-(unknown keys are rejected).
+A routine whose config depends on a value inside that config — a schema chosen by `method`, a cell
+resolved out of a matrix — resolves it *itself*, from a config class that is still one annotation:
+`peek`, `load_config` and `merge_specs` are public for exactly that.
 
 ## Run folders
 
-`@run` and `dispatch` open the folder for you. The pieces are also usable on their own, for a
-routine that opens a folder the config does not name — one cell of a sweep, say:
+`run` opens the folder for you. The pieces are also usable on their own, for a routine that opens a
+second folder of its own — one cell of a sweep, say:
 
 ```python
-from slimconfig import open_run, start_run, tee_stdout
-
-with open_run(cfg, log="eval.log"):       # snapshot + log, run_dir read off cfg
-    ...
+from slimconfig import start_run, tee_stdout
 
 start_run(cell_dir, cell_cfg)             # just the snapshot, into a folder you chose
 with tee_stdout(f"{cell_dir}/eval.log"):  # just the log
@@ -175,13 +181,11 @@ that made it. The snapshot is best-effort — provenance never aborts a run.
 
 | | |
 | --- | --- |
-| `@run(schema, log=...)` | make a function the entry point of a run: load, open the folder, log, call |
+| `run(fn[, config], **overrides)` | run this process as one run: config loaded (schema off `fn`'s annotation), folder opened, logged, called, exit with its status |
 | `load_config(schema, specs)` | merge specs onto a dataclass schema → a populated instance |
 | `merge_specs(specs)` | merge specs into one unvalidated `DictConfig` |
 | `peek(specs, key)` | read one top-level key before choosing a schema |
-| `dispatch(modes, specs)` | `mode` → handler, with the run folder opened, snapshotted, and logged |
-| `open_run(config, log=...)` | context manager: create the folder `config` names, snapshot it, tee the log |
-| `start_run(run_dir, config)` | create the run folder, write `config.yaml` + `run_meta.json` |
+| `start_run(run_dir, config)` | create the run folder, write `config.yaml` + `metadata.json` |
 | `tee_stdout(path, banner=None)` | context manager: also append stdout to `path` |
 | `load_mapping_yaml(path)` | one YAML → `DictConfig`, with `defaults:` composed |
 | `load_yaml(path)` | one YAML → `dict`, plain PyYAML, no composition |
