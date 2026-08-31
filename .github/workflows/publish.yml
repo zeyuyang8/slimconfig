@@ -1,19 +1,25 @@
-# Publish to PyPI on a version tag, via trusted publishing (OIDC) — no API token is stored here.
+# Publish to PyPI on a version tag.
 #
-# One-time setup on PyPI — the project exists, so add the publisher under the project itself
-# (https://pypi.org/manage/project/slimconfig/settings/publishing/):
+# Auth is the PYPI_API_TOKEN secret on the `pypi` environment, because trusted publishing (OIDC)
+# can only be set up from a browser and never was — a tag push without it dies at the token
+# exchange with `invalid-publisher`. To move to OIDC later, register the publisher at
+# https://pypi.org/manage/project/slimconfig/settings/publishing/ with
 #   Owner: zeyuyang8 | Repository: slimconfig | Workflow: publish.yml | Environment: pypi
-# Without it the publish job dies at the OIDC exchange with `invalid-publisher`.
-# Then release with:
+# then delete the `password:` line below and the secret; the OIDC permission is already granted.
+#
+# Release with:
 #   git tag v0.1.0 && git push origin v0.1.0
 # The tag must match slimconfig.__version__ (the build reads the version from there) — the check
-# job below fails the release if they disagree.
+# below fails the release if they disagree. A manual run (workflow_dispatch) skips that check and
+# publishes whatever the branch says, which is how you smoke-test credentials: every file is
+# already on PyPI, so skip-existing turns the upload into a no-op that still proves auth works.
 
 name: Publish
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -27,6 +33,7 @@ jobs:
           # otherwise setup-uv warns that the cache can never be invalidated.
           cache-dependency-glob: pyproject.toml
       - name: Tag matches slimconfig.__version__
+        if: github.ref_type == 'tag'
         run: |
           version=$(grep -oP '__version__ = "\K[^"]+' src/slimconfig/__init__.py)
           tag="${GITHUB_REF_NAME#v}"
@@ -41,8 +48,6 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     environment: pypi
-    permissions:
-      id-token: write  # mint the OIDC token PyPI trusted publishing verifies
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -50,6 +55,7 @@ jobs:
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
           # A version uploaded by hand (`uv build && twine upload`) is already on PyPI by the time
           # the tag lands; skip those files instead of failing the run.
           skip-existing: true
