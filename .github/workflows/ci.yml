@@ -15,8 +15,9 @@ jobs:
         python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
+          # Pinned to an exact tag: setup-uv stopped publishing a floating major (`@v10` 404s).
           # No uv.lock here (a library pins nothing), so key the cache on pyproject.toml —
           # otherwise setup-uv warns that the cache can never be invalidated.
           cache-dependency-glob: pyproject.toml
