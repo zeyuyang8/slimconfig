@@ -6,3 +6,6 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+# A library resolves against the consumer's constraints, so this repo pins nothing; `uv run` still
+# drops a lock here as a side effect of the dev venv.
+uv.lock

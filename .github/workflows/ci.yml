@@ -14,8 +14,12 @@ jobs:
       matrix:
         python-version: ["3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          # No uv.lock here (a library pins nothing), so key the cache on pyproject.toml —
+          # otherwise setup-uv warns that the cache can never be invalidated.
+          cache-dependency-glob: pyproject.toml
       - run: uv python install ${{ matrix.python-version }}
       - name: Install
         run: uv venv --python ${{ matrix.python-version }} && uv pip install -e ".[dev]"
