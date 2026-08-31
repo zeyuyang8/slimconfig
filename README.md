@@ -303,7 +303,7 @@ that made it. The snapshot is best-effort — provenance never aborts a run.
 | `schema_of(path)` | the class a config file was written for, without loading it |
 | `start_run(run_dir, config)` | create the run folder, write `config.yaml` + `metadata.json` |
 | `tee_stdout(path, banner=None)` | context manager: also append stdout to `path` |
-| `compose(path[, node])` | one YAML → the composed `DictConfig` plus every `_schema:` claim in it |
+| `compose(path[, node])` | one YAML → the composed `DictConfig`, every `_schema:` claim in it, and every nested block it writes |
 | `load_mapping_yaml(path)` | the same, keeping only the `DictConfig` |
 | `load_yaml(path)` | one YAML → `dict`, plain PyYAML, no composition |
 | `partial_of(cls[, name])` | the schema of one LAYER of `cls`: a subclass whose fields may be left unset |
@@ -311,9 +311,14 @@ that made it. The snapshot is best-effort — provenance never aborts a run.
 | `is_partial(cls)` | is this a layer schema? |
 | `check_schema(cls)` | reject a config class that cannot be filled from YAML |
 | `resolve_schema(dotted)` | import the class a `_schema:` line names |
-| `field_schema(root, node)` | the class that belongs at a dotted node of `root` |
+| `field_schema(root, node)` | the class that belongs at a node of `root` |
 | `fields_of(cls)` | each field's shape: `value`, `group`, or `table` (and of what class) |
 | `schema_name(cls)` | the dotted path a `_schema:` line would name `cls` by |
+
+A *node* is where something sits in a config, spelled as the sequence of keys — `("overrides",
+"model", "flux.1-dev")`. A dotted string is accepted too and split on `.`, which is the convenient
+way to write one by hand, but it cannot say what a key with a dot *in* it is: only whoever walked the
+mapping knows whether `flux.1-dev` is one key or two, so `compose` reports the keys it descended.
 
 A *spec* is a YAML file path, a `dotted.key=value` string, or a ready-made mapping/`DictConfig` —
 so a caller can merge values it computed at runtime under the same "later wins" rule. A mapping spec

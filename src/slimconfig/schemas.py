@@ -38,11 +38,26 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
-__all__ = ["check_schema", "field_schema", "fields_of", "placement", "resolve_schema", "schema_name"]
+__all__ = [
+    "Node",
+    "check_schema",
+    "field_schema",
+    "fields_of",
+    "placement",
+    "resolve_schema",
+    "schema_name",
+]
+
+# WHERE A NODE IS, SPELLED AS THE KEYS AND NOT AS ONE STRING. A dotted path is the convenient way to
+# WRITE one by hand (`optim.lr`), but it cannot say what a key with a dot in it is: `overrides.model.
+# flux.1-dev` is four keys or five depending on the table's keys, and only whoever walked the mapping
+# knows which. So compose() reports a claim's node as the tuple of keys it actually descended, and
+# anything that resolves a node takes either — a string is split on ".", a sequence is taken as given.
+type Node = str | Sequence[str]
 
 # What a field holds: a value, one nested config class, or a keyed table of one.
 type Shape = tuple[Literal["value", "group", "table"], type | None]
@@ -174,13 +189,13 @@ def resolve_schema(dotted: str) -> type:
 # class — because an entry is a group and the table itself is not: it has no class of its own to fill,
 # only however many the keys name. The walk stops at the first key it cannot place; nothing below a leaf
 # or an unknown key is a node of this schema.
-def _walk(root: type, node: str) -> Iterator[tuple[str, Placement]]:
+def _walk(root: type, node: Node) -> Iterator[tuple[tuple[str, ...], Placement]]:
     current: type | None = root
     entry_of: type | None = None  # set when the last key landed on a table: the class its entries have
     walked: list[str] = []
-    for key in [k for k in node.split(".") if k]:
+    for key in [k for k in node.split(".") if k] if isinstance(node, str) else list(node):
         walked.append(key)
-        path = ".".join(walked)
+        path = tuple(walked)
         if entry_of is not None:  # this key is a table KEY, not a field name
             current, entry_of = entry_of, None
             yield path, ("entry", current)
@@ -201,36 +216,35 @@ def _walk(root: type, node: str) -> Iterator[tuple[str, Placement]]:
             yield path, ("group", nested)
 
 
-# What `node` (a dotted path) lands on inside `root` — see Placement. `root` itself for the empty path.
-# The non-raising half of field_schema, for a caller that wants to ASK rather than require.
-def placement(root: type, node: str) -> Placement:
+# What `node` lands on inside `root` — see Placement. `root` itself for the empty path. The non-raising
+# half of field_schema, for a caller that wants to ASK rather than require.
+def placement(root: type, node: Node) -> Placement:
     last: Placement = ("group", root)
     for _, where in _walk(root, node):
         last = where
     return last
 
 
-# The config class that belongs at `node` (a dotted path) inside `root`; `root` itself for the empty
-# path. Raises if the path does not land on a config class, which is what a `defaults:` under a leaf
-# field looks like.
-def field_schema(root: type, node: str) -> type:
+# The config class that belongs at `node` inside `root`; `root` itself for the empty path. Raises if the
+# path does not land on a config class, which is what a `defaults:` under a leaf field looks like.
+def field_schema(root: type, node: Node) -> type:
     current, kind = root, "group"
-    walked = ""
+    walked: tuple[str, ...] = ()
     for path, (kind, cls) in _walk(root, node):
         walked = path
         if kind == "unknown":
-            parent, _, key = path.rpartition(".")
-            where = f"{schema_name(root)}.{parent}" if parent else schema_name(root)
-            raise ValueError(f"{where} has no field {key!r}")
+            where = ".".join((schema_name(root), *path[:-1]))
+            raise ValueError(f"{where} has no field {path[-1]!r}")
         if kind == "value":
             raise ValueError(
-                f"{schema_name(root)}.{path} is a value, not a nested config class — "
+                f"{schema_name(root)}.{'.'.join(path)} is a value, not a nested config class — "
                 "only a group can be composed from a config file"
             )
         current = cls if cls is not None else current
     if kind == "table":
+        where = ".".join(walked)
         raise ValueError(
-            f"{schema_name(root)}.{walked} is a table of {schema_name(current)}, not a config "
-            f"class — name one entry (`{walked}.<key>`), since the table itself has no class to fill"
+            f"{schema_name(root)}.{where} is a table of {schema_name(current)}, not a config "
+            f"class — name one entry (`{where}.<key>`), since the table itself has no class to fill"
         )
     return current

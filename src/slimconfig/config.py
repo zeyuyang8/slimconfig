@@ -83,9 +83,9 @@ OmegaConf.register_new_resolver("from_yaml", _select_from_yaml, replace=True, us
 class Claim(NamedTuple):
     """One `_schema:` line: the config class `node` was written against, and the file that said so."""
 
-    node: str      # dotted path from the root of the config being loaded ("" = the root itself)
-    schema: str    # the dotted import path the file named
-    source: str    # the file it was read from, for the error message
+    node: tuple[str, ...]  # the keys from the root of the config being loaded (() = the root itself)
+    schema: str            # the dotted import path the file named
+    source: str            # the file it was read from, for the error message
 
 
 class Block(NamedTuple):
@@ -96,8 +96,8 @@ class Block(NamedTuple):
     schema can say which ones are config classes, and the schema is not known here.
     """
 
-    node: str      # dotted path from the root of the config being loaded (never "" — that is the file)
-    source: str    # the file that wrote it, for the error message
+    node: tuple[str, ...]  # the keys from the root of the config being loaded (never () — that is the file)
+    source: str            # the file that wrote it, for the error message
 
 
 class Composed(NamedTuple):
@@ -120,9 +120,10 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
 
 
 # Compose `path` and everything its `defaults:` chains pull in. `node` is where the file is being
-# mounted: "" for a config loaded on its own, `optim` for one listed under an `optim:` block — every
-# claim it makes is reported relative to that, so load_config can check it against the right class.
-def compose(path: str | Path, node: str = "") -> Composed:
+# mounted, as the keys that lead to it: () for a config loaded on its own, ("optim",) for one listed
+# under an `optim:` block — every claim it makes is reported relative to that, so load_config can check
+# it against the right class. Keys and not one dotted string, because a table key may contain a dot.
+def compose(path: str | Path, node: tuple[str, ...] = ()) -> Composed:
     claims: list[Claim] = []
     blocks: list[Block] = []
     cfg = _compose_file(Path(path).resolve(), node, (), claims, blocks)
@@ -156,7 +157,11 @@ def _load_one(path: Path) -> DictConfig:
 # One config FILE, composed at `node`. Every file must open by naming the class it fills: that is the
 # one thing a reader (and load_config) needs in order to know what the keys below it mean.
 def _compose_file(
-    path: Path, node: str, visiting: tuple[Path, ...], claims: list[Claim], blocks: list[Block]
+    path: Path,
+    node: tuple[str, ...],
+    visiting: tuple[Path, ...],
+    claims: list[Claim],
+    blocks: list[Block],
 ) -> DictConfig:
     if path in visiting:
         chain = " -> ".join(str(p) for p in (*visiting, path))
@@ -175,7 +180,7 @@ def _compose_file(
 # over what it lists — at every depth, not just the top.
 def _compose_node(
     node_cfg: DictConfig,
-    node: str,
+    node: tuple[str, ...],
     source: str,
     visiting: tuple[Path, ...],
     claims: list[Claim],
@@ -204,7 +209,7 @@ def _compose_node(
     raw = cast(dict, OmegaConf.to_container(node_cfg, resolve=False))
     for key, value in raw.items():
         if isinstance(value, dict):
-            child_node = f"{node}.{key}" if node else str(key)
+            child_node = (*node, str(key))
             blocks.append(Block(child_node, source))
             node_cfg[key] = _compose_node(
                 cast(DictConfig, node_cfg[key]), child_node, source, visiting, claims, blocks
@@ -213,11 +218,11 @@ def _compose_node(
 
 
 # The `defaults:` list of one mapping, popped and validated.
-def _defaults_of(node_cfg: DictConfig, node: str, source: str) -> list[str]:
+def _defaults_of(node_cfg: DictConfig, node: tuple[str, ...], source: str) -> list[str]:
     defaults = node_cfg.pop(DEFAULTS_KEY, None)
     if defaults is None:
         return []
-    where = f"{source!r}" + (f" (under `{node}`)" if node else "")
+    where = f"{source!r}" + (f" (under `{'.'.join(node)}`)" if node else "")
     if not isinstance(defaults, ListConfig):
         raise ValueError(
             f"config file {where}: `{DEFAULTS_KEY}` must be a list of yaml paths, "

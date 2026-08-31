@@ -66,6 +66,13 @@ class MatrixConfig:
     per_model: dict[str, Data] = MISSING  # a table of a COMPLETE class: every entry is whole
 
 
+# A table with FREE-FORM string keys whose entries hold a group. That is the shape where a key with a
+# dot in it — `flux.1-dev` — makes a dotted node path ambiguous.
+@dataclass
+class ModelMatrix:
+    per_model: dict[str, TrainPart] = MISSING
+
+
 @dataclass
 class Axis:
     low: float = MISSING

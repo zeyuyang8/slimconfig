@@ -122,7 +122,7 @@ def _check_claims(schema: type, claims: tuple[Claim, ...]) -> None:
         target = field_schema(schema, claim.node)
         declared = resolve_schema(claim.schema)
         if not issubclass(target, declared):
-            where = f"`{claim.node}`" if claim.node else "the top level"
+            where = f"`{'.'.join(claim.node)}`" if claim.node else "the top level"
             raise ValueError(
                 f"config file {claim.source!r} says it fills {claim.schema}, but it is being merged onto "
                 f"{where} of {schema_name(schema)}, which is {schema_name(target)}"
@@ -149,9 +149,9 @@ def _check_declared(schema: type, blocks: tuple[Block, ...], claims: tuple[Claim
         if kind != "group" or cls is None:
             continue
         raise ValueError(
-            f"config file {block.source!r} writes the block `{block.node}`, which fills the config class "
-            f"{schema_name(cls)}, without saying so: add `_schema: {schema_name(cls)}` at the top of that "
-            f"block. Every mapping that fills a config class names the class it fills."
+            f"config file {block.source!r} writes the block `{'.'.join(block.node)}`, which fills the "
+            f"config class {schema_name(cls)}, without saying so: add `_schema: {schema_name(cls)}` at "
+            f"the top of that block. Every mapping that fills a config class names the class it fills."
         )
 
 
@@ -182,7 +182,7 @@ def peek(args: list[Spec], key: str) -> Any:
 # imported. For an entry point that dispatches on the config it was handed.
 def schema_of(path: str) -> type:
     claims = compose(path).claims
-    root = next((c for c in claims if c.node == ""), None)
+    root = next((c for c in claims if not c.node), None)
     if root is None:  # compose() rejects a file with no top-level `_schema:`, so this cannot happen
         raise ValueError(f"config file {path!r} declares no top-level `_schema:`")
     return resolve_schema(root.schema)

@@ -65,7 +65,7 @@ def test_the_schema_line_is_consumed_not_merged(tmp_path, write):
 def test_compose_reports_the_claim_and_where_it_was_made(tmp_path, write):
     path = write(tmp_path / "a.yaml", "a: 1\n", schema="fixtures.TrainConfig")
     claims = compose(path).claims
-    assert [(c.node, c.schema) for c in claims] == [("", "fixtures.TrainConfig")]
+    assert [(c.node, c.schema) for c in claims] == [((), "fixtures.TrainConfig")]
     assert claims[0].source == path
 
 
@@ -73,8 +73,8 @@ def test_a_nested_block_may_restate_its_class(tmp_path, write):
     body = "model: llama\noptim:\n  _schema: fixtures.Optim\n  lr: 0.1\n"
     claims = compose(write(tmp_path / "a.yaml", body)).claims
     assert [(c.node, c.schema) for c in claims] == [
-        ("", "fixtures.TrainConfig"),
-        ("optim", "fixtures.Optim"),
+        ((), "fixtures.TrainConfig"),
+        (("optim",), "fixtures.Optim"),
     ]
 
 
@@ -175,8 +175,8 @@ def test_a_mounted_fragment_reports_its_claim_at_the_mount_point(tmp_path, monke
     write(tmp_path / "cosine.yaml", "lr: 2.0e-4\n", schema="fixtures.Optim")
     child = write(tmp_path / "train.yaml", "optim:\n  defaults: [cosine.yaml]\n")
     assert [(c.node, c.schema) for c in compose(child).claims] == [
-        ("", "fixtures.TrainConfig"),
-        ("optim", "fixtures.Optim"),
+        ((), "fixtures.TrainConfig"),
+        (("optim",), "fixtures.Optim"),
     ]
 
 

@@ -175,6 +175,18 @@ def test_a_group_inside_a_table_entry_still_names_itself(tmp_path, write):
         load_config(fixtures.MatrixConfig, [path])
 
 
+def test_a_table_key_may_contain_a_dot(tmp_path, write):
+    # `flux.1-dev` is ONE key, so the node of the block under it is ("per_model", "flux.1-dev", "optim")
+    # — three keys. Written as one dotted string it would re-split into four and place nothing.
+    body = "per_model:\n  flux.1-dev:\n    optim:\n{line}      lr: 0.1\n"
+    bare = write(tmp_path / "bare.yaml", body.format(line=""), schema="fixtures.ModelMatrix")
+    with pytest.raises(ValueError, match=r"block `per_model.flux.1-dev.optim`.*TrainPart.OptimPart"):
+        load_config(fixtures.ModelMatrix, [bare])
+    named = body.format(line="      _schema: fixtures.TrainPart.OptimPart\n")
+    path = write(tmp_path / "m.yaml", named, schema="fixtures.ModelMatrix")
+    assert load_config(fixtures.ModelMatrix, [path]).per_model["flux.1-dev"].optim.lr == 0.1
+
+
 def test_a_block_that_only_mounts_a_fragment_is_named_by_the_fragment(tmp_path, monkeypatch, write):
     # `optim:` holds nothing but a `defaults:`, and the file it lists declares the class AT that node.
     monkeypatch.chdir(tmp_path)
