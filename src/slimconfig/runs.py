@@ -1,11 +1,18 @@
 # The run layer: one folder per run, holding the config that produced it, the log of it, and its results.
 #
-#   * run        — the launcher, and the whole of a script's __main__. TWO inputs: the function to run,
-#                  and the config to run it on. Everything else is a field of that config.
+#   * run        — the launcher, and the whole of a script's __main__: the function to run, the config to
+#                  run it on, and the folder to run it into.
 #   * start_run  — the snapshot on its own (config.yaml + metadata.json), for a routine that opens a
 #                  second folder of its own (one cell of a sweep, say).
 #   * tee_stdout — the log on its own.
-# What a run WRITES into the folder is the function's job — it reads the path off its own config.
+#
+# WHERE A RUN WRITES IS NOT PART OF ITS CONFIG. A config says what to compute; the folder and the log say
+# where this particular launch puts it, which is a property of the invocation — the same config re-run
+# into a scratch directory is the same config. So `run_dir` and `log` are arguments of the launcher, from
+# the command line (`--run-dir` / `--log`) or from the script (`run(main, run_dir=...)`), and no config
+# class declares them. A run dir that is a FUNCTION of the config — an identity-addressed output tree —
+# is passed as a function, which is one rule in code instead of the same interpolation copied into every
+# config file that lands there. Both are recorded in the folder's metadata.json either way.
 
 from __future__ import annotations
 
@@ -23,12 +30,19 @@ from typing import Any, NoReturn, cast, get_type_hints
 
 from omegaconf import DictConfig, OmegaConf
 
+from .config import SCHEMA_KEY
+from .schemas import schema_name
 from .structured import Spec, load_config
 
-# What every config `run` accepts must declare. The launcher reads both off the loaded config: the folder
-# it opens, and the log inside it. A schema missing either one is a programming error, not a config error,
-# so it is reported at launch with the field named.
-RUN_FIELDS = ("run_dir", "log")
+__all__ = ["run", "start_run", "tee_stdout"]
+
+# Where a run writes, spelled on the command line. Both take `--flag value` or `--flag=value`.
+RUN_DIR_FLAG = "--run-dir"
+LOG_FLAG = "--log"
+NO_LOG_FLAG = "--no-log"
+
+# A run dir given to `run`: the path itself, or a function of the loaded config that returns it.
+type RunDir = str | Callable[[Any], str]
 
 
 def _git(*args: str) -> subprocess.CompletedProcess:
@@ -59,9 +73,19 @@ def _as_dictconfig(config: Any) -> DictConfig:
     raise TypeError(f"cannot snapshot config of type {type(config).__name__}")
 
 
+# The `_schema:` line that makes a snapshot a config file like any other, so a run can be repeated from
+# its own folder (`python train.py <run_dir>/config.yaml --run-dir <somewhere>`). A snapshot of something
+# that is not a schema instance — a mapping a routine assembled — names no class and gets no line.
+def _schema_line(config: Any) -> str:
+    if not (dataclasses.is_dataclass(config) and not isinstance(config, type)):
+        return ""
+    return f"{SCHEMA_KEY}: {schema_name(type(config))}\n"
+
+
 # Open the run's folder and record what produced it. Writes two files:
-#   config.yaml   — the fully-resolved config, re-runnable as-is (`python run.py <run_dir>/config.yaml`)
-#   metadata.json — argv / cwd / git commit / start time / host
+#   config.yaml   — the fully-resolved config, re-runnable as-is
+#                   (`python run.py <run_dir>/config.yaml --run-dir <somewhere>`)
+#   metadata.json — argv / cwd / run dir / git commit / start time / host
 # Everything the run produces goes in this same folder, so a result is never separated from its config.
 # The folder itself must be creatable (the run needs somewhere to write); the snapshot is best-effort —
 # provenance never aborts a run.
@@ -71,10 +95,11 @@ def start_run(run_dir: str, config: Any) -> str:
         # Render BOTH payloads before touching a file: re-running a run from its own snapshot
         # (`python run.py <run_dir>/config.yaml`) passes the very file we are about to overwrite, and
         # opening it "w" first would truncate it out from under the read.
-        snapshot = OmegaConf.to_yaml(_as_dictconfig(config), resolve=True)
+        snapshot = _schema_line(config) + OmegaConf.to_yaml(_as_dictconfig(config), resolve=True)
         meta = json.dumps({
             "argv": sys.argv,
             "cwd": os.getcwd(),
+            "run_dir": os.path.abspath(run_dir),
             "started": datetime.now(UTC).isoformat(timespec="seconds"),
             "host": socket.gethostname(),
             **_git_head(),
@@ -129,16 +154,9 @@ def tee_stdout(path: str, banner: str | None = None) -> Iterator[str]:
             sys.stdout = real
 
 
-# Open `cfg.run_dir`, snapshot the config into it, and tee stdout to `<run_dir>/<cfg.log>` (log unset for
-# no log). The folder layer `run` is built on.
+# Open `run_dir`, snapshot `cfg` into it, and tee stdout to `<run_dir>/<log>` (log None for no log).
 @contextlib.contextmanager
-def _open_run(cfg: Any) -> Iterator[str]:
-    run_dir, log = cfg.run_dir, cfg.log
-    if not run_dir:
-        raise SystemExit(
-            "this run has nowhere to write: `run_dir` is unset — every run owns a folder holding its "
-            "config, its log, and its results"
-        )
+def _open_run(run_dir: str, log: str | None, cfg: Any) -> Iterator[str]:
     start_run(run_dir, cfg)
     if not log:
         yield run_dir
@@ -149,9 +167,11 @@ def _open_run(cfg: Any) -> Iterator[str]:
         yield run_dir
 
 
-# The schema `function` takes, read off its one annotated parameter. A function IS its config: one
-# argument, typed, so the entry point names the routine and the schema comes with it.
-def _schema_of(function: Callable[[Any], int | None]) -> type:
+# What `function` takes: its config class, read off the first parameter's annotation, and whether it
+# also wants the run folder. A function IS its config — one annotated argument, so the entry point names
+# the routine and the schema comes with it — plus an OPTIONAL second argument, `run_dir: str`, for a
+# routine that writes into the folder (which is most of them).
+def _signature_of(function: Callable[..., int | None]) -> tuple[type, bool]:
     if not callable(function):
         raise TypeError(f"run() takes a function of one config argument, not {type(function).__name__}")
     name = getattr(function, "__qualname__", repr(function))
@@ -159,53 +179,113 @@ def _schema_of(function: Callable[[Any], int | None]) -> type:
         p for p in inspect.signature(function).parameters.values()
         if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
     ]
-    if len(params) != 1:
-        raise TypeError(f"{name} must take exactly one argument (its config), not {len(params)}")
-    schema = get_type_hints(function).get(params[0].name)
+    if not 1 <= len(params) <= 2:
+        raise TypeError(
+            f"{name} must take its config, and optionally the run folder — one or two arguments, "
+            f"not {len(params)}"
+        )
+    hints = get_type_hints(function)
+    schema = hints.get(params[0].name)
     if not (isinstance(schema, type) and dataclasses.is_dataclass(schema)):
         raise TypeError(
             f"{name}'s argument `{params[0].name}` must be annotated with its config class "
             f"(a dataclass), got {schema!r}"
         )
-    fields = {f.name for f in dataclasses.fields(schema)}
-    missing = [f for f in RUN_FIELDS if f not in fields]
-    if missing:
+    if len(params) == 2 and hints.get(params[1].name) is not str:
         raise TypeError(
-            f"{schema.__name__} is missing {' and '.join(f'`{f}`' for f in missing)}: every config "
-            f"`run` takes declares {' and '.join(f'`{f}`' for f in RUN_FIELDS)} — the folder the run owns "
-            "and the log file inside it"
+            f"{name}'s second argument `{params[1].name}` is the run folder and must be annotated "
+            f"`str`, got {hints.get(params[1].name)!r}"
         )
-    return schema
+    return schema, len(params) == 2
 
 
-# Run this process as one run. Two inputs:
-#   function — the routine to run. It takes ONE argument, annotated with its config class, and returns
-#              this process's exit status (None → 0).
+# Pull `--run-dir` / `--log` / `--no-log` out of an argv tail, returning what is left (the config specs)
+# and whichever of the two the command line set. `--no-log` is how a launch says "no log file" over a
+# script that asked for one — every rank of a distributed launch would otherwise append to one path.
+def _split_argv(argv: list[str]) -> tuple[list[str], str | None, str | None, bool]:
+    specs: list[str] = []
+    taken: dict[str, str] = {}
+    no_log = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        i += 1
+        if arg == NO_LOG_FLAG:
+            no_log = True
+            continue
+        flag = next((f for f in (RUN_DIR_FLAG, LOG_FLAG) if arg == f or arg.startswith(f + "=")), None)
+        if flag is None:
+            specs.append(arg)
+            continue
+        if arg != flag:
+            taken[flag] = arg[len(flag) + 1 :]
+            continue
+        if i >= len(argv):
+            raise SystemExit(f"{flag} needs a value")
+        taken[flag], i = argv[i], i + 1
+    return specs, taken.get(RUN_DIR_FLAG), taken.get(LOG_FLAG), no_log
+
+
+def _usage(extra: str = "") -> NoReturn:
+    script = os.path.basename(sys.argv[0]) or "run.py"
+    raise SystemExit(
+        (extra + "\n" if extra else "")
+        + f"usage: {script} <config.yaml> [key=value ...] [{RUN_DIR_FLAG} PATH] [{LOG_FLAG} NAME | {NO_LOG_FLAG}]"
+    )
+
+
+# Run this process as one run:
+#   function — the routine to run. It takes its config (one argument, annotated with its config class)
+#              and optionally the run folder (a second argument annotated `str`), and returns this
+#              process's exit status (None -> 0).
 #   config   — the YAML file to load that class from. Omitted, it comes off the command line
 #              (`<config.yaml> [key=value ...]`), which is how a stepN script is normally launched.
+#   run_dir  — the folder this run owns: a path, or a function of the loaded config returning one.
+#              `--run-dir` on the command line wins over it; one of the two must say.
+#   log      — the log file inside that folder, None for no log. `--log` / `--no-log` win over it.
 # Keyword arguments are `key=value` overrides applied on top, the same ones the command line takes:
 # `run(train, "configs/train.yaml", **{"optim.lr": 1e-4})`.
 #
-# The config class must declare `run_dir` and `log`. That is the whole of the launcher's contract: it
-# loads the config strictly (every field required), opens `run_dir`, drops the config snapshot and
-# metadata.json in it, tees the function's stdout to `log` inside it, calls the function, and exits with
-# its status.
+# The launcher loads the config strictly (every field required, every file naming the class it fills),
+# creates the run folder, drops the config snapshot and metadata.json in it, tees the function's stdout
+# to the log inside it, calls the function, and exits with its status.
 #
-#     def train(cfg: TrainConfig) -> int:
-#         ...                                     # write results under cfg.run_dir
+#     def train(cfg: TrainConfig, run_dir: str) -> int:
+#         ...                                     # write results under run_dir
 #
-#     if __name__ == "__main__":                  # python train.py configs/train.yaml optim.lr=1e-4
-#         run(train)
+#     if __name__ == "__main__":                  # python train.py configs/train.yaml optim.lr=1e-4 \
+#         run(train, log="train.log")             #     --run-dir runs/exp1
 #
 # `run` never returns — it exits with the function's status — so a script's __main__ spells neither
 # sys.argv nor SystemExit.
-def run(function: Callable[[Any], int | None], config: str | None = None, /, **overrides: Any) -> NoReturn:
-    schema = _schema_of(function)
-    specs: list[Spec] = [config] if config is not None else list(sys.argv[1:])
+def run(
+    function: Callable[..., int | None],
+    config: str | None = None,
+    /,
+    *,
+    run_dir: RunDir | None = None,
+    log: str | None = None,
+    **overrides: Any,
+) -> NoReturn:
+    schema, wants_run_dir = _signature_of(function)
+    argv_specs, cli_run_dir, cli_log, no_log = _split_argv(list(sys.argv[1:]))
+    specs: list[Spec] = [config] if config is not None else cast(list[Spec], argv_specs)
     if not specs:
-        raise SystemExit(f"usage: {os.path.basename(sys.argv[0]) or 'run.py'} <config.yaml> [key=value ...]")
+        _usage()
     specs += [f"{key}={value}" for key, value in overrides.items()]
+
     cfg = load_config(schema, specs)
-    with _open_run(cfg):
-        status = function(cfg)
+
+    where = cli_run_dir if cli_run_dir is not None else run_dir
+    if callable(where):
+        where = where(cfg)
+    if not where:
+        _usage(
+            "this run has nowhere to write: pass `--run-dir PATH`, or give the script a run dir "
+            "(`run(fn, run_dir=...)`) — every run owns a folder holding its config, its log and its results"
+        )
+    log_name = None if no_log else (cli_log if cli_log is not None else log)
+
+    with _open_run(where, log_name, cfg):
+        status = function(cfg, where) if wants_run_dir else function(cfg)
     raise SystemExit(status)

@@ -59,3 +59,5 @@ extend-ignore = ["E203"]
 # Every config problem is reported as ValueError, including the isinstance guards (TRY004 wants
 # TypeError there); the ${now:...} stamp is intentionally local time (DTZ005).
 "src/slimconfig/config.py" = ["TRY004", "DTZ005"]
+"src/slimconfig/structured.py" = ["TRY004"]
+"src/slimconfig/schemas.py" = ["TRY004"]

@@ -2,37 +2,55 @@
 #
 #     from slimconfig import run
 #
-#     def main(cfg: MyConfig) -> int:             # MyConfig: a dataclass of MISSING fields, two of
-#         ...                                     # which are `run_dir` (results go under it) and `log`
+#     def main(cfg: MyConfig, run_dir: str) -> int:   # MyConfig: a dataclass of MISSING leaves and
+#         ...                                         # nested config classes; results go under run_dir
 #
-#     if __name__ == "__main__":                  # python main.py configs/my.yaml
+#     if __name__ == "__main__":                      # python main.py configs/my.yaml --run-dir runs/x
 #         run(main)
 #
-# See config.py for the YAML loader + `defaults:` composition and the ${now:...} / ${from_yaml:...}
-# resolvers, structured.py for the typed, all-fields-required schema loader, runs.py for the run folder
-# every entry point owns — its config snapshot, its log, its results — and paths.py for the project-root
-# rule relative paths resolve against.
+# Four rules:
+#   * a config class is a @dataclass of LEAVES and NESTED CONFIG CLASSES — groups are composed as
+#     fields, not inherited as mixins, so a value's name says where it came from (schemas.py);
+#   * a config FILE names the class it fills (`_schema: <dotted.path>`), and a hierarchical class takes
+#     a hierarchical file (structured.py);
+#   * every leaf is required — nothing is silently defaulted, "off" is spelled `null` (structured.py);
+#   * where a run WRITES is not part of its config: `run_dir` and `log` are the launcher's, from the
+#     command line or the script (runs.py).
+#
+# See config.py for the YAML loader, the `defaults:` composition that works at any depth, and the
+# ${now:...} / ${from_yaml:...} resolvers; and paths.py for the project-root rule relative paths
+# resolve against.
 
-from .config import load_mapping_yaml, load_yaml
+from .config import Claim, Composed, compose, load_mapping_yaml, load_yaml
 from .paths import project_root, resolve_path
 from .runs import (
-    RUN_FIELDS,
     run,
     start_run,
     tee_stdout,
+)
+from .schemas import (
+    check_schema,
+    field_schema,
+    resolve_schema,
+    schema_name,
 )
 from .structured import (
     Spec,
     load_config,
     merge_specs,
     peek,
+    schema_of,
 )
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
-    "RUN_FIELDS",
+    "Claim",
+    "Composed",
     "Spec",
+    "check_schema",
+    "compose",
+    "field_schema",
     "load_config",
     "load_mapping_yaml",
     "load_yaml",
@@ -40,7 +58,10 @@ __all__ = [
     "peek",
     "project_root",
     "resolve_path",
+    "resolve_schema",
     "run",
+    "schema_name",
+    "schema_of",
     "start_run",
     "tee_stdout",
 ]

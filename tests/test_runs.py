@@ -3,81 +3,58 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+import os
+import subprocess
+import sys
 
+import fixtures
 import pytest
-from omegaconf import MISSING, OmegaConf
+from omegaconf import OmegaConf
 
 from slimconfig import load_config, run, start_run, tee_stdout
 
-
-@dataclass
-class Optim:
-    lr: float = MISSING
-    warmup_steps: int = MISSING
-
-
-@dataclass
-class TrainConfig:
-    run_dir: str = MISSING
-    log: str | None = MISSING
-    model: str = MISSING
-    tags: list[str] = MISSING
-    resume_from: str | None = MISSING
-    optim: Optim = field(default_factory=Optim)
-
-
-# The two ways a schema can fail the launcher's one requirement.
-@dataclass
-class NoFolderConfig:
-    model: str = MISSING
-
-
-@dataclass
-class NoLogConfig:
-    run_dir: str = MISSING
-    model: str = MISSING
-
-
 FULL = """
-run_dir: runs/demo
-log: null
 model: llama
 tags: []
 resume_from: null
 optim:
   lr: 0.0002
   warmup_steps: 100
+data:
+  path: data/corpus.parquet
 """
-
-
-def write(path, text: str) -> str:
-    path.write_text(text, encoding="utf-8")
-    return str(path)
 
 
 # ── start_run ────────────────────────────────────────────────────────────────
 
 
-def test_start_run_writes_a_resolved_snapshot_and_meta(tmp_path):
-    cfg = load_config(TrainConfig, [write(tmp_path / "a.yaml", FULL)])
+def test_start_run_writes_a_resolved_snapshot_and_meta(tmp_path, write):
+    cfg = load_config(fixtures.TrainConfig, [write(tmp_path / "a.yaml", FULL)])
     run_dir = start_run(str(tmp_path / "runs" / "demo"), cfg)
     snapshot = OmegaConf.load(f"{run_dir}/config.yaml")
     assert snapshot.model == "llama"
     meta = json.loads((tmp_path / "runs" / "demo" / "metadata.json").read_text())
-    assert {"argv", "cwd", "started", "host"} <= meta.keys()
+    assert {"argv", "cwd", "run_dir", "started", "host"} <= meta.keys()
+    assert meta["run_dir"] == str(tmp_path / "runs" / "demo")
 
 
-def test_start_run_snapshot_is_rerunnable_in_place(tmp_path):
+def test_the_snapshot_names_the_class_so_it_is_a_config_like_any_other(tmp_path, write):
+    cfg = load_config(fixtures.TrainConfig, [write(tmp_path / "a.yaml", FULL)])
+    start_run(str(tmp_path / "run"), cfg)
+    assert (tmp_path / "run" / "config.yaml").read_text().startswith("_schema: fixtures.TrainConfig\n")
+
+
+def test_start_run_snapshot_is_rerunnable_in_place(tmp_path, write):
     # Re-running a run from its own snapshot passes the very file start_run overwrites.
-    run_dir = start_run(str(tmp_path / "run"), load_config(TrainConfig, [write(tmp_path / "a.yaml", FULL)]))
+    cfg = load_config(fixtures.TrainConfig, [write(tmp_path / "a.yaml", FULL)])
+    run_dir = start_run(str(tmp_path / "run"), cfg)
     snapshot = f"{run_dir}/config.yaml"
-    start_run(run_dir, load_config(TrainConfig, [snapshot]))
-    assert load_config(TrainConfig, [snapshot]).model == "llama"
+    start_run(run_dir, load_config(fixtures.TrainConfig, [snapshot]))
+    assert load_config(fixtures.TrainConfig, [snapshot]).model == "llama"
 
 
-def test_start_run_accepts_a_dataclass_instance(tmp_path):
-    cfg = load_config(TrainConfig, [write(tmp_path / "a.yaml", FULL)])
+def test_start_run_accepts_a_dataclass_instance(tmp_path, write):
+    cfg = load_config(fixtures.TrainConfig, [write(tmp_path / "a.yaml", FULL)])
     run_dir = start_run(str(tmp_path / "run"), cfg)
     assert OmegaConf.load(f"{run_dir}/config.yaml").optim.warmup_steps == 100
 
@@ -123,111 +100,223 @@ def test_tee_stdout_is_undone_after_an_exception(tmp_path, capsys):
 
 
 # `run` is a process boundary: it exits with the status the function returned. Every test below launches
-# it the way a shell would — the specs on the command line — and reads that status back off the
-# SystemExit, which is what the shell would see.
-def launch(monkeypatch, specs, function, *args, **overrides) -> object:
-    monkeypatch.setattr("sys.argv", ["train.py", *specs])
+# it the way a shell would — the specs and the flags on the command line — and reads that status back off
+# the SystemExit, which is what the shell would see.
+def launch(monkeypatch, argv, function, *args, **kwargs) -> object:
+    monkeypatch.setattr("sys.argv", ["train.py", *argv])
     with pytest.raises(SystemExit) as exit_info:
-        run(function, *args, **overrides)
+        run(function, *args, **kwargs)
     return exit_info.value.code
 
 
-def test_run_loads_the_config_and_opens_the_folder(tmp_path, monkeypatch):
-    def train(cfg: TrainConfig) -> int:
+def test_run_loads_the_config_and_opens_the_folder(tmp_path, monkeypatch, write):
+    def train(cfg: fixtures.TrainConfig, run_dir: str) -> int:
         print(f"training {cfg.model}")
         (tmp_path / "run" / "result.txt").write_text(cfg.model)  # results land in the run folder
         return 0
 
-    specs = [write(tmp_path / "a.yaml", FULL), f"run_dir={tmp_path / 'run'}", "log=train.log"]
-    assert launch(monkeypatch, specs, train) == 0
+    argv = [write(tmp_path / "a.yaml", FULL), "--run-dir", str(tmp_path / "run")]
+    assert launch(monkeypatch, argv, train, log="train.log") == 0
     assert (tmp_path / "run" / "config.yaml").is_file()
     assert (tmp_path / "run" / "metadata.json").is_file()
     assert (tmp_path / "run" / "result.txt").read_text() == "llama"
     assert "training llama" in (tmp_path / "run" / "train.log").read_text()
 
 
-def test_run_exits_zero_when_the_function_returns_nothing(tmp_path, monkeypatch):
-    def train(cfg: TrainConfig) -> None:
+def test_run_exits_zero_when_the_function_returns_nothing(tmp_path, monkeypatch, write):
+    def train(cfg: fixtures.TrainConfig) -> None:
         return None
 
-    specs = [write(tmp_path / "a.yaml", FULL), f"run_dir={tmp_path / 'run'}"]
-    assert launch(monkeypatch, specs, train) is None
+    argv = [write(tmp_path / "a.yaml", FULL), f"--run-dir={tmp_path / 'run'}"]
+    assert launch(monkeypatch, argv, train) is None
 
 
-def test_run_takes_its_specs_from_the_command_line(tmp_path, monkeypatch):
-    def train(cfg: TrainConfig) -> int:
+def test_run_takes_its_specs_from_the_command_line(tmp_path, monkeypatch, write):
+    def train(cfg: fixtures.TrainConfig) -> int:
         return 0 if cfg.model == "qwen" else 1
 
-    specs = [write(tmp_path / "a.yaml", FULL), f"run_dir={tmp_path / 'run'}", "model=qwen"]
-    assert launch(monkeypatch, specs, train) == 0
+    argv = [write(tmp_path / "a.yaml", FULL), f"--run-dir={tmp_path / 'run'}", "model=qwen"]
+    assert launch(monkeypatch, argv, train) == 0
 
 
-def test_run_takes_a_config_path_and_overrides_from_the_caller(tmp_path, monkeypatch):
-    def train(cfg: TrainConfig) -> int:
+def test_run_takes_a_config_path_and_overrides_from_the_caller(tmp_path, monkeypatch, write):
+    def train(cfg: fixtures.TrainConfig) -> int:
         return 0 if (cfg.model, cfg.optim.lr) == ("qwen", 0.5) else 1
 
     path = write(tmp_path / "a.yaml", FULL)
     # The command line is ignored when the caller names the config itself.
     code = launch(
         monkeypatch, ["ignored.yaml"], train, path,
-        **{"model": "qwen", "optim.lr": 0.5, "run_dir": str(tmp_path / "run")},
+        run_dir=str(tmp_path / "run"), **{"model": "qwen", "optim.lr": 0.5},
     )
     assert code == 0
     assert (tmp_path / "run" / "config.yaml").is_file()
 
 
 def test_run_reports_usage_when_given_no_config(monkeypatch):
-    def train(cfg: TrainConfig) -> int:
+    def train(cfg: fixtures.TrainConfig) -> int:
         raise AssertionError("must not run")
 
     assert "usage: train.py <config.yaml>" in str(launch(monkeypatch, [], train))
 
 
-def test_run_writes_the_log_the_config_names_and_nothing_when_it_is_null(tmp_path, monkeypatch):
-    def loud(cfg: TrainConfig) -> None:
+# ── run: where it writes is the launcher's, not the config's ─────────────────
+
+
+def test_the_script_can_name_the_run_dir(tmp_path, monkeypatch, write):
+    seen = {}
+
+    def train(cfg: fixtures.TrainConfig, run_dir: str) -> None:
+        seen["dir"] = run_dir
+
+    launch(monkeypatch, [write(tmp_path / "a.yaml", FULL)], train, run_dir=str(tmp_path / "fixed"))
+    assert seen["dir"] == str(tmp_path / "fixed")
+
+
+def test_the_command_line_wins_over_the_script(tmp_path, monkeypatch, write):
+    seen = {}
+
+    def train(cfg: fixtures.TrainConfig, run_dir: str) -> None:
+        seen["dir"] = run_dir
+
+    argv = [write(tmp_path / "a.yaml", FULL), "--run-dir", str(tmp_path / "cli")]
+    launch(monkeypatch, argv, train, run_dir=str(tmp_path / "script"))
+    assert seen["dir"] == str(tmp_path / "cli")
+
+
+def test_the_run_dir_can_be_a_function_of_the_config(tmp_path, monkeypatch, write):
+    # An identity-addressed output tree is one rule in code, not the same interpolation in every file.
+    seen = {}
+
+    def train(cfg: fixtures.TrainConfig, run_dir: str) -> None:
+        seen["dir"] = run_dir
+
+    argv = [write(tmp_path / "a.yaml", FULL)]
+    launch(monkeypatch, argv, train, run_dir=lambda cfg: str(tmp_path / f"runs/{cfg.model}"))
+    assert seen["dir"] == str(tmp_path / "runs" / "llama")
+
+
+def test_run_requires_a_folder_to_write_in(tmp_path, monkeypatch, write):
+    def train(cfg: fixtures.TrainConfig) -> int:
+        raise AssertionError("must not run")
+
+    assert "nowhere to write" in str(launch(monkeypatch, [write(tmp_path / "a.yaml", FULL)], train))
+
+
+def test_a_config_may_not_smuggle_the_run_dir_back_in(tmp_path, monkeypatch, write):
+    # `run_dir` is not a field of any config class, so setting it is an unknown key like any other.
+    def train(cfg: fixtures.TrainConfig) -> int:
+        raise AssertionError("must not run")
+
+    argv = [write(tmp_path / "a.yaml", FULL + "run_dir: runs/sneaky\n"), f"--run-dir={tmp_path}"]
+    monkeypatch.setattr("sys.argv", ["train.py", *argv])
+    with pytest.raises(Exception, match="run_dir"):
+        run(train)
+
+
+# ── run: the log ─────────────────────────────────────────────────────────────
+
+
+def test_the_script_names_the_log_and_the_command_line_can_move_it(tmp_path, monkeypatch, write):
+    def loud(cfg: fixtures.TrainConfig) -> None:
         print("named")
 
-    def quiet(cfg: TrainConfig) -> None:
+    argv = [write(tmp_path / "a.yaml", FULL), f"--run-dir={tmp_path / 'run'}"]
+    launch(monkeypatch, argv, loud, log="train.log")
+    launch(monkeypatch, [*argv, "--log", "other.log"], loud, log="train.log")
+    assert "named" in (tmp_path / "run" / "train.log").read_text()
+    assert "named" in (tmp_path / "run" / "other.log").read_text()
+
+
+def test_no_log_turns_off_the_one_the_script_asked_for(tmp_path, monkeypatch, write):
+    # Every rank of a distributed launch would otherwise append to the one path.
+    def quiet(cfg: fixtures.TrainConfig) -> None:
         print("quiet")
 
-    specs = [write(tmp_path / "a.yaml", FULL), f"run_dir={tmp_path / 'run'}"]
-    launch(monkeypatch, [*specs, "log=quality.log"], loud)
-    launch(monkeypatch, [*specs, "log=null"], quiet)
-    assert "named" in (tmp_path / "run" / "quality.log").read_text()
-    assert sorted(p.name for p in (tmp_path / "run").glob("*.log")) == ["quality.log"]
+    argv = [write(tmp_path / "a.yaml", FULL), f"--run-dir={tmp_path / 'run'}", "--no-log"]
+    launch(monkeypatch, argv, quiet, log="train.log")
+    assert list((tmp_path / "run").glob("*.log")) == []
 
 
-def test_run_puts_the_log_where_the_config_asks(tmp_path, monkeypatch):
-    def train(cfg: TrainConfig) -> None:
+def test_a_script_that_asks_for_no_log_writes_none(tmp_path, monkeypatch, write):
+    def quiet(cfg: fixtures.TrainConfig) -> None:
+        print("quiet")
+
+    argv = [write(tmp_path / "a.yaml", FULL), f"--run-dir={tmp_path / 'run'}"]
+    launch(monkeypatch, argv, quiet)
+    assert list((tmp_path / "run").glob("*.log")) == []
+
+
+def test_the_log_may_sit_in_a_subfolder(tmp_path, monkeypatch, write):
+    def train(cfg: fixtures.TrainConfig) -> None:
         print("nested")
 
-    specs = [write(tmp_path / "a.yaml", FULL), f"run_dir={tmp_path / 'run'}", "log=logs/train.log"]
-    launch(monkeypatch, specs, train)
+    argv = [write(tmp_path / "a.yaml", FULL), f"--run-dir={tmp_path / 'run'}"]
+    launch(monkeypatch, argv, train, log="logs/train.log")
     assert "nested" in (tmp_path / "run" / "logs" / "train.log").read_text()
 
 
-def test_run_requires_a_folder_to_write_in(tmp_path, monkeypatch):
-    def train(cfg: TrainConfig) -> int:
+def test_a_flag_with_no_value_is_an_error(tmp_path, monkeypatch, write):
+    def train(cfg: fixtures.TrainConfig) -> None:
         raise AssertionError("must not run")
 
-    specs = [write(tmp_path / "a.yaml", FULL.replace("run_dir: runs/demo", "run_dir: ''"))]
-    assert "nowhere to write" in str(launch(monkeypatch, specs, train))
+    argv = [write(tmp_path / "a.yaml", FULL), "--run-dir"]
+    assert "--run-dir needs a value" in str(launch(monkeypatch, argv, train))
 
 
 # ── run: the function IS its config ──────────────────────────────────────────
 
 
-def test_run_takes_the_schema_off_the_function_s_annotation(tmp_path, monkeypatch):
+def test_run_takes_the_schema_off_the_function_s_annotation(tmp_path, monkeypatch, write):
     seen = {}
 
-    def train(cfg: TrainConfig) -> int:
+    def train(cfg: fixtures.TrainConfig) -> int:
         seen["type"] = type(cfg).__name__
         seen["lr"] = cfg.optim.lr
         return 0
 
-    specs = [write(tmp_path / "a.yaml", FULL), f"run_dir={tmp_path / 'run'}"]
-    assert launch(monkeypatch, specs, train) == 0
+    argv = [write(tmp_path / "a.yaml", FULL), f"--run-dir={tmp_path / 'run'}"]
+    assert launch(monkeypatch, argv, train) == 0
     assert seen == {"type": "TrainConfig", "lr": 0.0002}  # loaded, typed, not a mapping of strings
+
+
+SOLO_SCRIPT = '''
+from dataclasses import dataclass, field
+from omegaconf import MISSING
+from slimconfig import run
+
+@dataclass
+class Optim:
+    lr: float = MISSING
+
+@dataclass
+class SoloConfig:
+    model: str = MISSING
+    optim: Optim = field(default_factory=Optim)
+
+def main(cfg: SoloConfig, run_dir: str) -> int:
+    print(f"{cfg.model} {cfg.optim.lr}")
+    return 0
+
+if __name__ == "__main__":
+    run(main, log="train.log")
+'''
+
+
+def test_a_one_file_script_can_name_its_own_classes(tmp_path):
+    # A config class defined in the launched script lives in `__main__`; the YAML has to call it
+    # something. Launched for real, because that is the only way `__main__` is what it will be.
+    (tmp_path / "solo.py").write_text(SOLO_SCRIPT, encoding="utf-8")
+    (tmp_path / "solo.yaml").write_text(
+        "_schema: solo.SoloConfig\nmodel: llama\noptim:\n  lr: 0.5\n", encoding="utf-8"
+    )
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    argv = [sys.executable, "solo.py", "solo.yaml", "--run-dir", "run"]
+    done = subprocess.run(argv, cwd=tmp_path, env=env, capture_output=True, text=True, check=False)
+    assert done.returncode == 0, done.stderr
+    assert "llama 0.5" in done.stdout
+    # ...and the snapshot names it the same way, so the run is repeatable from its own folder.
+    assert (tmp_path / "run" / "config.yaml").read_text().startswith("_schema: solo.SoloConfig\n")
 
 
 def test_run_rejects_a_function_that_is_not_one_of():
@@ -236,10 +325,10 @@ def test_run_rejects_a_function_that_is_not_one_of():
 
 
 def test_run_rejects_a_function_of_the_wrong_arity():
-    def train(cfg: TrainConfig, extra: int) -> int:
+    def train(cfg: fixtures.TrainConfig, run_dir: str, extra: int) -> int:
         return 0
 
-    with pytest.raises(TypeError, match="exactly one argument"):
+    with pytest.raises(TypeError, match="one or two arguments"):
         run(train)
 
 
@@ -251,17 +340,9 @@ def test_run_rejects_an_unannotated_function():
         run(train)
 
 
-def test_run_rejects_a_config_class_without_a_run_dir_or_a_log():
-    def train(cfg: NoFolderConfig) -> int:
+def test_run_rejects_a_second_argument_that_is_not_the_run_folder():
+    def train(cfg: fixtures.TrainConfig, extra: int) -> int:
         return 0
 
-    with pytest.raises(TypeError, match="missing `run_dir` and `log`"):
-        run(train)
-
-
-def test_run_rejects_a_config_class_without_a_log():
-    def train(cfg: NoLogConfig) -> int:
-        return 0
-
-    with pytest.raises(TypeError, match="missing `log`"):
+    with pytest.raises(TypeError, match="is the run folder and must be annotated"):
         run(train)
