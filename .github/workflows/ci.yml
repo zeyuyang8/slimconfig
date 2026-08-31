@@ -21,6 +21,9 @@ jobs:
           # No uv.lock here (a library pins nothing), so key the cache on pyproject.toml —
           # otherwise setup-uv warns that the cache can never be invalidated.
           cache-dependency-glob: pyproject.toml
+          # Both matrix legs resolve the same glob, so without a suffix they race for one
+          # cache key and the loser warns "unable to reserve cache".
+          cache-suffix: ${{ matrix.python-version }}
       - run: uv python install ${{ matrix.python-version }}
       - name: Install
         run: uv venv --python ${{ matrix.python-version }} && uv pip install -e ".[dev]"
