@@ -168,7 +168,7 @@ runs/exp1/
 | --- | --- |
 | `function` | the routine to run. Its **first argument is annotated with its config class** — the function *is* its config, so `run` reads the schema off that annotation and there is nothing else to name. An optional **second argument, `run_dir: str`**, is the folder. Returns this process's exit status (`None` → 0). |
 | `config` | the YAML file to load it from. Omitted, it comes off the command line (`<config.yaml> [key=value ...]`) — the usual way a script is launched. |
-| `run_dir=` | the folder this run owns: a path, or a **function of the loaded config** returning one. `--run-dir PATH` on the command line wins over it; one of the two must say, or the launch stops. |
+| `run_dir=` | the folder this run owns: a path, or a **function** returning one — of the loaded config, and of the config file itself if it takes a second argument. `--run-dir PATH` on the command line wins over it; one of the two must say, or the launch stops. |
 | `log=` | the log file inside that folder, `None` for no log. `--log NAME` and `--no-log` win over it — the latter is how a distributed launch says "not every rank appends to one file". |
 
 Keyword arguments are `key=value` overrides on top, the same ones the command line takes:
@@ -182,6 +182,15 @@ code, rather than the same interpolation copied into every config file that land
 
 ```python
 run(main, run_dir=lambda cfg: f"runs/{cfg.model}/lr{cfg.optim.lr}")
+```
+
+The other naming rule worth having — a folder named after the config that produced it, so a result and
+the file that asked for it are findable from each other — needs the file, which only the launcher
+knows. A run-dir function that takes a second argument gets it (`""` if the config came from
+overrides alone):
+
+```python
+run(main, run_dir=lambda cfg, config: f"runs/{Path(config).stem}")
 ```
 
 The log captures **stdout only** — progress bars go to stderr, and 45 KB of progress bars is not a

@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import fixtures
 import pytest
@@ -194,6 +195,36 @@ def test_the_run_dir_can_be_a_function_of_the_config(tmp_path, monkeypatch, writ
     argv = [write(tmp_path / "a.yaml", FULL)]
     launch(monkeypatch, argv, train, run_dir=lambda cfg: str(tmp_path / f"runs/{cfg.model}"))
     assert seen["dir"] == str(tmp_path / "runs" / "llama")
+
+
+def test_the_run_dir_can_be_named_after_the_config_that_produced_it(tmp_path, monkeypatch, write):
+    # The commonest naming rule there is, and the launcher is the only one who knows which file it was.
+    seen = {}
+
+    def train(cfg: fixtures.TrainConfig, run_dir: str) -> None:
+        seen["dir"] = run_dir
+
+    def named(cfg, config: str) -> str:
+        return str(tmp_path / "runs" / Path(config).stem)
+
+    launch(monkeypatch, [write(tmp_path / "sweep_a.yaml", FULL)], train, run_dir=named)
+    assert seen["dir"] == str(tmp_path / "runs" / "sweep_a")
+
+
+def test_a_run_with_no_config_file_names_no_config(tmp_path, monkeypatch):
+    # Overrides alone are a legal launch, so the second argument has to have an empty answer.
+    seen = {}
+
+    def train(cfg: fixtures.TrainConfig, run_dir: str) -> None:
+        seen["dir"] = run_dir
+
+    def named(cfg, config: str) -> str:
+        return str(tmp_path / "runs" / (Path(config).stem or "unnamed"))
+
+    argv = ["model=llama", "tags=[]", "resume_from=null", "optim.lr=0.1",
+            "optim.warmup_steps=1", "data.path=x"]
+    launch(monkeypatch, argv, train, run_dir=named)
+    assert seen["dir"] == str(tmp_path / "runs" / "unnamed")
 
 
 def test_run_requires_a_folder_to_write_in(tmp_path, monkeypatch, write):

@@ -41,8 +41,11 @@ RUN_DIR_FLAG = "--run-dir"
 LOG_FLAG = "--log"
 NO_LOG_FLAG = "--no-log"
 
-# A run dir given to `run`: the path itself, or a function of the loaded config that returns it.
-type RunDir = str | Callable[[Any], str]
+# A run dir given to `run`: the path itself, or a function returning it. The function takes the loaded
+# config, and OPTIONALLY the config file this launch was given as a second argument — which is how a
+# script says "the folder is named after the config that produced it", the one naming rule that keeps a
+# result and the file that asked for it findable from each other.
+type RunDir = str | Callable[..., str]
 
 
 def _git(*args: str) -> subprocess.CompletedProcess:
@@ -226,6 +229,20 @@ def _split_argv(argv: list[str]) -> tuple[list[str], str | None, str | None, boo
     return specs, taken.get(RUN_DIR_FLAG), taken.get(LOG_FLAG), no_log
 
 
+# How many arguments a run-dir function wants: the config, or the config and the file it came from.
+def _positional_count(function: Callable[..., Any]) -> int:
+    return len([
+        p for p in inspect.signature(function).parameters.values()
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ])
+
+
+# The config FILE this launch was given — the first spec that names one. "" when the config came from
+# overrides or a mapping alone, so a run-dir function that names a folder after it can say so itself.
+def _primary_config(specs: list[Spec]) -> str:
+    return next((s for s in specs if isinstance(s, str) and os.path.isfile(s)), "")
+
+
 def _usage(extra: str = "") -> NoReturn:
     script = os.path.basename(sys.argv[0]) or "run.py"
     raise SystemExit(
@@ -240,7 +257,8 @@ def _usage(extra: str = "") -> NoReturn:
 #              process's exit status (None -> 0).
 #   config   — the YAML file to load that class from. Omitted, it comes off the command line
 #              (`<config.yaml> [key=value ...]`), which is how a stepN script is normally launched.
-#   run_dir  — the folder this run owns: a path, or a function of the loaded config returning one.
+#   run_dir  — the folder this run owns: a path, or a function returning one — of the loaded config, and
+#              of the config file itself if it takes a second argument (`lambda cfg, path: ...`).
 #              `--run-dir` on the command line wins over it; one of the two must say.
 #   log      — the log file inside that folder, None for no log. `--log` / `--no-log` win over it.
 # Keyword arguments are `key=value` overrides applied on top, the same ones the command line takes:
@@ -278,7 +296,7 @@ def run(
 
     where = cli_run_dir if cli_run_dir is not None else run_dir
     if callable(where):
-        where = where(cfg)
+        where = where(cfg, _primary_config(specs)) if _positional_count(where) > 1 else where(cfg)
     if not where:
         _usage(
             "this run has nowhere to write: pass `--run-dir PATH`, or give the script a run dir "
