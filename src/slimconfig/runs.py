@@ -82,17 +82,24 @@ def _as_dictconfig(config: Any) -> DictConfig:
 # reload, which is the strongest possible check that the rule is the same on both sides. Table entries
 # get none: their class comes from the table. `_schema` is written FIRST in each block, where a reader
 # looks for it.
+#
+# What the SCHEMA says a field holds only tells us where a block WOULD be; the value has to be one. A
+# partial (`partial_of`) leaves fields unset, and an unset group or table comes out of to_container as
+# the string "???" — there is no block there to name, so it is written through as it is.
 def _stamp(node: Mapping[str, Any], cls: type, tag: bool = True) -> dict[str, Any]:
     out: dict[str, Any] = {SCHEMA_KEY: schema_name(cls)} if tag else {}
     shapes = fields_of(cls)
     for key, value in node.items():
         kind, nested = shapes.get(key, ("value", None))
-        if nested is None or value is None:
+        if nested is None or not isinstance(value, Mapping):
             out[key] = value
         elif kind == "group":
             out[key] = _stamp(value, nested)
         else:  # a table: the entries are not tagged, but any group INSIDE one still is
-            out[key] = {k: _stamp(v, nested, tag=False) for k, v in value.items()}
+            out[key] = {
+                k: _stamp(v, nested, tag=False) if isinstance(v, Mapping) else v
+                for k, v in value.items()
+            }
     return out
 
 

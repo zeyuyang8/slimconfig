@@ -56,6 +56,28 @@ def test_start_run_snapshot_is_rerunnable_in_place(tmp_path, write):
     assert load_config(fixtures.TrainConfig, [snapshot]).model == "llama"
 
 
+def test_a_snapshot_of_a_matrix_stamps_its_blocks_and_still_reloads(tmp_path, write):
+    # The layers are PARTIAL, so most of `base` is unset — an unset group is not a block to stamp.
+    body = "stage: main\nper_model: {}\nbase:\n  _schema: fixtures.TrainPart\n  model: a\nper_stage:\n"
+    body += "  main:\n    optim:\n      _schema: fixtures.TrainPart.OptimPart\n      lr: 0.1\n"
+    cfg = load_config(fixtures.MatrixConfig, [write(tmp_path / "m.yaml", body, schema="fixtures.MatrixConfig")])
+    run_dir = start_run(str(tmp_path / "run"), cfg)
+    text = (tmp_path / "run" / "config.yaml").read_text()
+    assert text.startswith("_schema: fixtures.MatrixConfig\n")
+    assert "  _schema: fixtures.TrainPart\n" in text  # the `base` group, named
+    assert "_schema: fixtures.MatrixConfig\nper_stage:\n  main:\n" not in text  # a table entry, not named
+    assert load_config(fixtures.MatrixConfig, [f"{run_dir}/config.yaml"]) == cfg
+
+
+def test_a_snapshot_leaves_an_unset_table_alone(tmp_path, write):
+    # A layer's unset table is not a table in the snapshot, it is `???` — there is no block to stamp.
+    body = "per_stage: {}\nbase:\n  _schema: fixtures.SearchPart\n  trials: 4\n"
+    path = write(tmp_path / "s.yaml", body, schema="fixtures.SearchMatrix")
+    cfg = load_config(fixtures.SearchMatrix, [path])
+    run_dir = start_run(str(tmp_path / "run"), cfg)
+    assert load_config(fixtures.SearchMatrix, [f"{run_dir}/config.yaml"]) == cfg
+
+
 def test_start_run_accepts_a_dataclass_instance(tmp_path, write):
     cfg = load_config(fixtures.TrainConfig, [write(tmp_path / "a.yaml", FULL)])
     run_dir = start_run(str(tmp_path / "run"), cfg)

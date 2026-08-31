@@ -66,6 +66,29 @@ class MatrixConfig:
     per_model: dict[str, Data] = MISSING  # a table of a COMPLETE class: every entry is whole
 
 
+@dataclass
+class Axis:
+    low: float = MISSING
+    high: float = MISSING
+
+
+# A run whose own schema has a TABLE, so a layer of it can leave that table unset — which is the one
+# shape where the schema says "table here" and the value is not one.
+@dataclass
+class Search:
+    trials: int = MISSING
+    axes: dict[str, Axis] = MISSING
+
+
+SearchPart = partial_of(Search, name="SearchPart")
+
+
+@dataclass
+class SearchMatrix:
+    base: SearchPart = field(default_factory=SearchPart)
+    per_stage: dict[Stage, SearchPart] = MISSING
+
+
 # ── schemas that are not well-formed ─────────────────────────────────────────
 
 
