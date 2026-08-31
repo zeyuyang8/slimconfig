@@ -11,7 +11,7 @@ import fixtures
 import pytest
 from omegaconf import MISSING
 
-from slimconfig import check_schema, field_schema, resolve_schema, schema_name
+from slimconfig import check_schema, field_schema, fields_of, resolve_schema, schema_name
 
 # ── check_schema ─────────────────────────────────────────────────────────────
 
@@ -107,3 +107,36 @@ def test_an_unknown_field_is_rejected():
 def test_a_leaf_is_not_a_group():
     with pytest.raises(ValueError, match="is a value, not a nested config class"):
         field_schema(fixtures.TrainConfig, "model")
+
+
+# ── tables ───────────────────────────────────────────────────────────────────
+
+
+def test_fields_of_tells_the_three_shapes_apart():
+    shapes = fields_of(fixtures.MatrixConfig)
+    assert shapes["stage"] == ("value", None)
+    assert shapes["base"] == ("group", fixtures.TrainPart)
+    assert shapes["per_model"] == ("table", fixtures.Data)
+
+
+def test_a_dict_of_plain_values_is_a_leaf():
+    @dataclass
+    class WithWeights:
+        weights: dict[str, float] = MISSING
+
+    assert fields_of(WithWeights)["weights"] == ("value", None)
+
+
+def test_a_table_entry_walks_to_the_entry_class():
+    assert field_schema(fixtures.MatrixConfig, "per_model.flux") is fixtures.Data
+    assert field_schema(fixtures.MatrixConfig, "per_stage.main.optim") is fixtures.TrainPart.OptimPart
+
+
+def test_the_table_itself_has_no_class_to_fill():
+    # `per_model` is however many Datas the keys name, not one config — so a file cannot be mounted on it.
+    with pytest.raises(ValueError, match="name one entry"):
+        field_schema(fixtures.MatrixConfig, "per_model")
+
+
+def test_a_table_needs_no_default_factory():
+    check_schema(fixtures.MatrixConfig)  # its entries do not exist until a config file names their keys

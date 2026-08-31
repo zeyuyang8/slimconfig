@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 from omegaconf import MISSING
+
+from slimconfig import partial_of
 
 
 # A base of Optim: it states a SUBSET of the fields, which is what a shared fragment does — so a file
@@ -39,6 +42,28 @@ class TrainConfig:
     resume_from: str | None = MISSING
     optim: Optim = field(default_factory=Optim)
     data: Data = field(default_factory=Data)
+
+
+# ── tables and layers ────────────────────────────────────────────────────────
+
+
+class Stage(StrEnum):
+    warmup = "warmup"
+    main = "main"
+
+
+# One LAYER of a training run: every field of TrainConfig, none of them required.
+TrainPart = partial_of(TrainConfig, name="TrainPart")
+
+
+@dataclass
+class MatrixConfig:
+    """A run built in layers: a base, refined by the layer its stage names."""
+
+    stage: Stage = MISSING
+    base: TrainPart = field(default_factory=TrainPart)
+    per_stage: dict[Stage, TrainPart] = MISSING  # enum-keyed: the KEYS are checked too
+    per_model: dict[str, Data] = MISSING  # a table of a COMPLETE class: every entry is whole
 
 
 # ── schemas that are not well-formed ─────────────────────────────────────────

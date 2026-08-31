@@ -5,8 +5,9 @@ built on [OmegaConf](https://omegaconf.readthedocs.io).
 
 Four rules, enforced at load time:
 
-* **A config class is a dataclass of leaves and nested config classes.** Groups are *composed* as
-  fields, not inherited as mixins, so every value's name says which group it came from.
+* **A config class is a dataclass of leaves, nested config classes, and tables of one.** Groups are
+  *composed* as fields, not inherited as mixins, so every value's name says which group it came from —
+  and no field is typed `Any`: one that holds a config names the class it holds.
 * **A config file names the class it fills** — `_schema: myproject.train.TrainConfig` — and a
   hierarchical class takes a hierarchical file. Rename the class and its configs break loudly.
 * **Every leaf is required.** A schema's leaves all default to `MISSING`, so a config has to set each
@@ -87,6 +88,54 @@ class TrainConfig:                     # ✓ optim.lr and data.path, in the clas
     optim: Optim = field(default_factory=Optim)
     data: Data = field(default_factory=Data)
 ```
+
+### Tables: several of the same group, keyed
+
+A field typed `dict[str, C]` — or `dict[SomeEnum, C]` — for a config class `C` holds **several** of
+that group, one per key: per model, per task, per environment. Entries are validated exactly like a
+group (unknown key rejected, values type-checked), and an `Enum` key type checks the *keys* too.
+
+```python
+@dataclass
+class Sweep:
+    axes: dict[str, Axis] = MISSING          # a table of Axis
+    weights: dict[str, float] = MISSING      # a dict of plain values: just a leaf
+```
+
+A table needs no `default_factory` — its entries do not exist until a config file names their keys —
+and a `defaults:` mounts on one *entry* (`axes.lr`), never on the table itself, which has no single
+class to fill.
+
+Mind the difference when a later spec overrides an earlier one. Mappings merge **key by key**, which is
+what you want for a table (`axes`) and wrong for a leaf that holds a set of things (`weights`): setting
+`weights: {a: 1, b: 1}` on top of `{a: 1, c: 1}` gives you all three. A layer can add a key to such a
+leaf but never drop one, so if two variants need two different sets, give each its own whole value at a
+node where only one of them applies — don't stack them.
+
+### Layers: a config that is allowed to say nothing
+
+Sometimes a run is composed at runtime out of several partial configs: a base, then whatever the
+per-model and per-method tables say for the cell being run. Type such a field with `partial_of`, not
+`Any`:
+
+```python
+from slimconfig import partial_of, stated
+
+CellPart = partial_of(RunConfig)                          # every field of RunConfig, none required
+
+@dataclass
+class Matrix:
+    base: CellPart = field(default_factory=CellPart)
+    per_method: dict[Method, CellPart] = MISSING
+
+cell = load_config(RunConfig, [stated(m.base), stated(m.per_method[method])])   # later wins
+```
+
+`partial_of(C)` is a real subclass of `C`, so a fragment written for `C` still mounts under it and
+every key and value is validated as usual; the one thing it drops is *required*. `stated(layer)`
+reads back only the fields that layer actually set, as a plain dict, which is what the resolver
+merges. An unset field stays `MISSING` rather than becoming `None`, so a layer that writes
+`resume_from: null` still overwrites — `null` is a value, silence is not.
 
 ## Share configs with `defaults:`
 
@@ -247,9 +296,13 @@ that made it. The snapshot is best-effort — provenance never aborts a run.
 | `compose(path[, node])` | one YAML → the composed `DictConfig` plus every `_schema:` claim in it |
 | `load_mapping_yaml(path)` | the same, keeping only the `DictConfig` |
 | `load_yaml(path)` | one YAML → `dict`, plain PyYAML, no composition |
+| `partial_of(cls[, name])` | the schema of one LAYER of `cls`: a subclass whose fields may be left unset |
+| `stated(layer)` | what one layer actually said, as a plain dict |
+| `is_partial(cls)` | is this a layer schema? |
 | `check_schema(cls)` | reject a config class that cannot be filled from YAML |
 | `resolve_schema(dotted)` | import the class a `_schema:` line names |
 | `field_schema(root, node)` | the class that belongs at a dotted node of `root` |
+| `fields_of(cls)` | each field's shape: `value`, `group`, or `table` (and of what class) |
 | `schema_name(cls)` | the dotted path a `_schema:` line would name `cls` by |
 
 A *spec* is a YAML file path, a `dotted.key=value` string, or a ready-made mapping/`DictConfig` —

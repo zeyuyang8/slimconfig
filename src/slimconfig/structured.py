@@ -25,7 +25,8 @@ from typing import Any, cast
 from omegaconf import DictConfig, OmegaConf
 
 from .config import Claim, compose
-from .schemas import check_schema, field_schema, resolve_schema, schema_name
+from .partials import is_partial
+from .schemas import check_schema, field_schema, fields_of, resolve_schema, schema_name
 
 # One config source: a YAML file path, a `dotted.key=value` override, or a ready-made mapping.
 type Spec = str | Mapping[str, Any] | DictConfig
@@ -39,18 +40,46 @@ class _Merged:
         self.claims = claims
 
 
-# Dotted paths of every leaf field still unset (recurses into nested configs).
-def _missing_fields(cfg: DictConfig, prefix: str = "") -> list[str]:
+# Dotted paths of every leaf field still unset, walking the SCHEMA rather than the merged node: a
+# partial subtree is allowed to be unset, and only the schema says which subtrees those are. (Merging a
+# partial's node onto a complete one promotes the result's runtime type to the partial, so asking the
+# node "are you partial?" would answer yes for a config that is genuinely incomplete.)
+def _missing_fields(cfg: DictConfig, schema: type, prefix: str = "") -> list[str]:
+    if is_partial(schema):  # a layer, not a run: saying nothing is what it is for
+        return []
     missing: list[str] = []
-    for raw_key in cfg:
-        key = str(raw_key)
-        if OmegaConf.is_missing(cfg, key):
-            missing.append(prefix + key)
+    for name, (kind, nested) in fields_of(schema).items():
+        if OmegaConf.is_missing(cfg, name):
+            missing.append(prefix + name)
             continue
-        value = cfg[key]
-        if OmegaConf.is_dict(value):  # recurse into nested configs only; lists are leaf values
-            missing.extend(_missing_fields(cast(DictConfig, value), prefix + key + "."))
+        value = cfg[name]
+        if nested is None or value is None:
+            continue
+        if kind == "group":
+            missing.extend(_missing_fields(cast(DictConfig, value), nested, f"{prefix}{name}."))
+        else:  # a table: each entry is checked like the group it is
+            missing.extend(
+                m for key in value for m in _missing_fields(value[key], nested, f"{prefix}{name}.{key}.")
+            )
     return missing
+
+
+# Turn the merged node into schema instances. OmegaConf's own `to_object` cannot do this: it raises on
+# any MISSING leaf inside a structured node, even one a partial is entitled to leave unset. So the walk
+# is ours — an unset field is simply not passed, and the class's own MISSING default stands.
+def _instantiate[T](node: DictConfig, schema: type[T]) -> T:
+    kwargs: dict[str, Any] = {}
+    for name, (kind, nested) in fields_of(cast(type, schema)).items():
+        if OmegaConf.is_missing(node, name):
+            continue
+        value = node[name]
+        if nested is None or value is None:
+            kwargs[name] = OmegaConf.to_object(value) if OmegaConf.is_config(value) else value
+        elif kind == "group":
+            kwargs[name] = _instantiate(cast(DictConfig, value), nested)
+        else:
+            kwargs[name] = {key: _instantiate(value[key], nested) for key in value}
+    return schema(**kwargs)
 
 
 def _merge(specs: list[Spec]) -> _Merged:
@@ -105,10 +134,10 @@ def load_config[T](schema: type[T], specs: list[Spec]) -> T:
     merged_specs = _merge(specs)
     _check_claims(cast(type, schema), merged_specs.claims)
     merged = OmegaConf.merge(OmegaConf.structured(schema), merged_specs.config)
-    missing = _missing_fields(cast(DictConfig, merged))
+    missing = _missing_fields(cast(DictConfig, merged), cast(type, schema))
     if missing:
         raise ValueError(f"{schema.__name__} is missing required field(s): {', '.join(missing)}")
-    return cast(T, OmegaConf.to_object(merged))
+    return _instantiate(cast(DictConfig, merged), schema)
 
 
 # Return `key` (dotted paths allowed) from the merged specs, or None — without validation, so a caller

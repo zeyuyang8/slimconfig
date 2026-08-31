@@ -9,8 +9,9 @@
 #         run(main)
 #
 # Four rules:
-#   * a config class is a @dataclass of LEAVES and NESTED CONFIG CLASSES — groups are composed as
-#     fields, not inherited as mixins, so a value's name says where it came from (schemas.py);
+#   * a config class is a @dataclass of LEAVES, NESTED CONFIG CLASSES and TABLES of one (`dict[K, C]`) —
+#     groups are composed as fields, not inherited as mixins, so a value's name says where it came from,
+#     and nothing is typed `Any`: a field that holds a config names its class (schemas.py);
 #   * a config FILE names the class it fills (`_schema: <dotted.path>`), and a hierarchical class takes
 #     a hierarchical file (structured.py);
 #   * every leaf is required — nothing is silently defaulted, "off" is spelled `null` (structured.py);
@@ -22,6 +23,7 @@
 # resolve against.
 
 from .config import Claim, Composed, compose, load_mapping_yaml, load_yaml
+from .partials import is_partial, partial_of, stated
 from .paths import project_root, resolve_path
 from .runs import (
     run,
@@ -31,6 +33,7 @@ from .runs import (
 from .schemas import (
     check_schema,
     field_schema,
+    fields_of,
     resolve_schema,
     schema_name,
 )
@@ -42,7 +45,7 @@ from .structured import (
     schema_of,
 )
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 
 __all__ = [
     "Claim",
@@ -51,10 +54,13 @@ __all__ = [
     "check_schema",
     "compose",
     "field_schema",
+    "fields_of",
+    "is_partial",
     "load_config",
     "load_mapping_yaml",
     "load_yaml",
     "merge_specs",
+    "partial_of",
     "peek",
     "project_root",
     "resolve_path",
@@ -63,5 +69,6 @@ __all__ = [
     "schema_name",
     "schema_of",
     "start_run",
+    "stated",
     "tee_stdout",
 ]
