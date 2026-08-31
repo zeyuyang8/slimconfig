@@ -1,11 +1,9 @@
-# Publish to PyPI on a version tag.
+# Publish to PyPI on a version tag, via trusted publishing (OIDC) — no API token is stored here.
 #
-# Auth is the PYPI_API_TOKEN secret on the `pypi` environment, because trusted publishing (OIDC)
-# can only be set up from a browser and never was — a tag push without it dies at the token
-# exchange with `invalid-publisher`. To move to OIDC later, register the publisher at
-# https://pypi.org/manage/project/slimconfig/settings/publishing/ with
+# The publisher registered on PyPI is
 #   Owner: zeyuyang8 | Repository: slimconfig | Workflow: publish.yml | Environment: pypi
-# then delete the `password:` line below and the secret; the OIDC permission is already granted.
+# and all four have to keep matching this file: rename the workflow or drop the environment and
+# the exchange fails with `invalid-publisher`.
 #
 # Release with:
 #   git tag v0.1.0 && git push origin v0.1.0
@@ -48,6 +46,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     environment: pypi
+    permissions:
+      id-token: write  # mint the OIDC token PyPI trusted publishing verifies
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -55,7 +55,6 @@ jobs:
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
           # A version uploaded by hand (`uv build && twine upload`) is already on PyPI by the time
           # the tag lands; skip those files instead of failing the run.
           skip-existing: true
