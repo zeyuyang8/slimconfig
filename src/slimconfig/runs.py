@@ -31,7 +31,7 @@ from typing import Any, NoReturn, cast, get_type_hints
 from omegaconf import DictConfig, OmegaConf
 
 from .config import SCHEMA_KEY
-from .schemas import schema_name
+from .schemas import fields_of, schema_name
 from .structured import Spec, load_config
 
 __all__ = ["run", "start_run", "tee_stdout"]
@@ -76,13 +76,34 @@ def _as_dictconfig(config: Any) -> DictConfig:
     raise TypeError(f"cannot snapshot config of type {type(config).__name__}")
 
 
-# The `_schema:` line that makes a snapshot a config file like any other, so a run can be repeated from
-# its own folder (`python train.py <run_dir>/config.yaml --run-dir <somewhere>`). A snapshot of something
-# that is not a schema instance — a mapping a routine assembled — names no class and gets no line.
-def _schema_line(config: Any) -> str:
+# The `_schema:` lines that make a snapshot a config file like any other, so a run can be repeated from
+# its own folder (`python train.py <run_dir>/config.yaml --run-dir <somewhere>`). Every block that fills
+# a config class gets one, exactly as a hand-written config must — a snapshot missing them would not
+# reload, which is the strongest possible check that the rule is the same on both sides. Table entries
+# get none: their class comes from the table. `_schema` is written FIRST in each block, where a reader
+# looks for it.
+def _stamp(node: Mapping[str, Any], cls: type, tag: bool = True) -> dict[str, Any]:
+    out: dict[str, Any] = {SCHEMA_KEY: schema_name(cls)} if tag else {}
+    shapes = fields_of(cls)
+    for key, value in node.items():
+        kind, nested = shapes.get(key, ("value", None))
+        if nested is None or value is None:
+            out[key] = value
+        elif kind == "group":
+            out[key] = _stamp(value, nested)
+        else:  # a table: the entries are not tagged, but any group INSIDE one still is
+            out[key] = {k: _stamp(v, nested, tag=False) for k, v in value.items()}
+    return out
+
+
+# The snapshot's YAML text. A config that is not a schema instance — a mapping a routine assembled —
+# names no class and is written as it is.
+def _snapshot(config: Any) -> str:
+    node = _as_dictconfig(config)
     if not (dataclasses.is_dataclass(config) and not isinstance(config, type)):
-        return ""
-    return f"{SCHEMA_KEY}: {schema_name(type(config))}\n"
+        return OmegaConf.to_yaml(node, resolve=True)
+    container = OmegaConf.to_container(node, resolve=True, enum_to_str=True)
+    return OmegaConf.to_yaml(OmegaConf.create(_stamp(cast(Mapping, container), type(config))))
 
 
 # Open the run's folder and record what produced it. Writes two files:
@@ -98,7 +119,7 @@ def start_run(run_dir: str, config: Any) -> str:
         # Render BOTH payloads before touching a file: re-running a run from its own snapshot
         # (`python run.py <run_dir>/config.yaml`) passes the very file we are about to overwrite, and
         # opening it "w" first would truncate it out from under the read.
-        snapshot = _schema_line(config) + OmegaConf.to_yaml(_as_dictconfig(config), resolve=True)
+        snapshot = _snapshot(config)
         meta = json.dumps({
             "argv": sys.argv,
             "cwd": os.getcwd(),

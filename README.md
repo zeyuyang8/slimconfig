@@ -8,8 +8,9 @@ Four rules, enforced at load time:
 * **A config class is a dataclass of leaves, nested config classes, and tables of one.** Groups are
   *composed* as fields, not inherited as mixins, so every value's name says which group it came from —
   and no field is typed `Any`: one that holds a config names the class it holds.
-* **A config file names the class it fills** — `_schema: myproject.train.TrainConfig` — and a
-  hierarchical class takes a hierarchical file. Rename the class and its configs break loudly.
+* **Every mapping that fills a config class names it** — `_schema: myproject.train.TrainConfig` — at
+  the top of a file and at the top of each nested block, so a hierarchical class takes a hierarchical
+  file that says what it is filling at every level. Rename the class and its configs break loudly.
 * **Every leaf is required.** A schema's leaves all default to `MISSING`, so a config has to set each
   one explicitly — "off" is still written out as `null`, an empty collection as `[]`. Nothing is
   silently inherited, and unknown keys are rejected.
@@ -53,7 +54,8 @@ print(cfg.optim.lr)
 # configs/train.yaml
 _schema: train.TrainConfig     # the class this file fills, by dotted import path
 model: llama-3-8b
-optim:                         # a nested class takes a nested block
+optim:                         # a nested class takes a nested block...
+  _schema: train.Optim         # ...which names its own class, the same way the file does
   lr: 2.0e-4
   warmup_steps: 100
 resume_from: null
@@ -66,6 +68,10 @@ python train.py configs/train.yaml optim.lr=1e-4   # ...plus dotted overrides, l
 
 Leave `warmup_steps` out and the load fails with
 `TrainConfig is missing required field(s): optim.warmup_steps` — before anything runs.
+
+Leave the block's `_schema:` out and the load fails the same way, naming the line to add: a block that
+fills a class is written against that class exactly as a file is. Table entries are the one exception —
+their class comes from the table's declaration, not from the entry.
 
 A nested field must carry `field(default_factory=...)`; a schema that forgets it, or that contains
 itself, is rejected by name at launch (`check_schema`). A class defined in the launched script is
@@ -152,6 +158,10 @@ warmup_steps: 100                  model: llama-3-7b
                                      defaults: [configs/optim/cosine.yaml]
                                      lr: 1.0e-4      # this file wins
 ```
+
+A block that mounts a fragment needs no `_schema:` of its own, as `optim:` above does not: the fragment
+it lists already names the class, at that node. The rule is that every block filling a config class is
+named — once, by whoever is in a position to say it.
 
 Because the mount point is named by the *parent*, a shared fragment states its own fields at its own
 top level and does not have to know where it will land. That is what the `_schema:` line buys: the

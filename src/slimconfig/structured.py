@@ -5,10 +5,11 @@
 # and/or dotted key=value overrides) onto that schema and returns a fully populated instance.
 #
 # Three rules, enforced at load time:
-#   * every config FILE names the class it fills (`_schema: <dotted.path>`) and that class must be the
-#     one the file is being merged onto, or a base of it — so a fragment cannot be mounted at a block
-#     it was not written for, and pointing a script at the wrong config fails by class name instead of
-#     by an unknown key three levels down;
+#   * every config FILE — and every nested BLOCK in one that fills a config class — names that class
+#     (`_schema: <dotted.path>`), and it must be the class it is being merged onto, or a base of it. So
+#     a fragment cannot be mounted at a block it was not written for, pointing a script at the wrong
+#     config fails by class name instead of by an unknown key three levels down, and a hierarchical
+#     config says at every level what it is filling instead of only at the top;
 #   * every leaf must end up set — an unset MISSING leaf raises (a nullable field that is "off" must
 #     still be present as null; an empty collection must be written out as []);
 #   * unknown keys are rejected (OmegaConf struct mode).
@@ -24,20 +25,21 @@ from typing import Any, cast
 
 from omegaconf import DictConfig, OmegaConf
 
-from .config import Claim, compose
+from .config import Block, Claim, compose
 from .partials import is_partial
-from .schemas import check_schema, field_schema, fields_of, resolve_schema, schema_name
+from .schemas import check_schema, field_schema, fields_of, placement, resolve_schema, schema_name
 
 # One config source: a YAML file path, a `dotted.key=value` override, or a ready-made mapping.
 type Spec = str | Mapping[str, Any] | DictConfig
 
 
 class _Merged:
-    """The merged specs and the `_schema:` claims the files among them made."""
+    """The merged specs, the `_schema:` claims the files among them made, and the blocks they wrote."""
 
-    def __init__(self, config: DictConfig, claims: tuple[Claim, ...]) -> None:
+    def __init__(self, config: DictConfig, claims: tuple[Claim, ...], blocks: tuple[Block, ...]) -> None:
         self.config = config
         self.claims = claims
+        self.blocks = blocks
 
 
 # Dotted paths of every leaf field still unset, walking the SCHEMA rather than the merged node: a
@@ -85,12 +87,14 @@ def _instantiate[T](node: DictConfig, schema: type[T]) -> T:
 def _merge(specs: list[Spec]) -> _Merged:
     merged = OmegaConf.create()
     claims: list[Claim] = []
+    blocks: list[Block] = []
     for spec in specs:
         if isinstance(spec, Mapping | DictConfig):
             merged = OmegaConf.merge(merged, spec)
         elif Path(spec).is_file():
             composed = compose(spec)
             claims.extend(composed.claims)
+            blocks.extend(composed.blocks)
             merged = OmegaConf.merge(merged, composed.config)
         elif "=" in spec:
             merged = OmegaConf.merge(merged, OmegaConf.from_dotlist([spec]))
@@ -98,7 +102,7 @@ def _merge(specs: list[Spec]) -> _Merged:
             raise FileNotFoundError(
                 f"config spec {spec!r} is neither a file nor a key=value override"
             )
-    return _Merged(cast(DictConfig, merged), tuple(claims))
+    return _Merged(cast(DictConfig, merged), tuple(claims), tuple(blocks))
 
 
 # Merge YAML files, dotted key=value overrides, and already-built mappings into one unstructured
@@ -125,6 +129,32 @@ def _check_claims(schema: type, claims: tuple[Claim, ...]) -> None:
             )
 
 
+# Hold every BLOCK that fills a config class to the same rule the top of a file is held to: name the
+# class. A file already says what it fills; a nested block is a second config class in the same file and
+# is just as much written-against-a-class, so it says so too — which is what makes a hierarchical config
+# readable on its own and what makes moving or renaming a nested class break its configs loudly.
+#
+# Only a GROUP is required to. A table's entries are config classes too, but which class was already
+# fixed, once, by the table's own declaration — every entry of a `dict[Method, CellPart]` is a CellPart
+# and cannot be anything else, so an entry naming it adds a line that can be wrong and never informative.
+# A table itself and a leaf have no class to name at all, and a claim on either is already an error
+# (field_schema). An unknown node is left alone: OmegaConf's struct check reports it far better than a
+# missing-`_schema` complaint would.
+def _check_declared(schema: type, blocks: tuple[Block, ...], claims: tuple[Claim, ...]) -> None:
+    declared = {claim.node for claim in claims}
+    for block in blocks:
+        if block.node in declared:
+            continue
+        kind, cls = placement(schema, block.node)
+        if kind != "group" or cls is None:
+            continue
+        raise ValueError(
+            f"config file {block.source!r} writes the block `{block.node}`, which fills the config class "
+            f"{schema_name(cls)}, without saying so: add `_schema: {schema_name(cls)}` at the top of that "
+            f"block. Every mapping that fills a config class names the class it fills."
+        )
+
+
 # Merge `specs` (YAML files and/or dotted key=value overrides) onto `schema`, in order (list a file
 # before the overrides that should win over it). Returns a fully-populated schema instance. Raises
 # ValueError if a file names the wrong class or any leaf is left unset, FileNotFoundError for a bad
@@ -133,6 +163,7 @@ def load_config[T](schema: type[T], specs: list[Spec]) -> T:
     check_schema(cast(type, schema))
     merged_specs = _merge(specs)
     _check_claims(cast(type, schema), merged_specs.claims)
+    _check_declared(cast(type, schema), merged_specs.blocks, merged_specs.claims)
     merged = OmegaConf.merge(OmegaConf.structured(schema), merged_specs.config)
     missing = _missing_fields(cast(DictConfig, merged), cast(type, schema))
     if missing:

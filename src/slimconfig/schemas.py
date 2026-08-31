@@ -38,13 +38,23 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
-__all__ = ["check_schema", "field_schema", "fields_of", "resolve_schema", "schema_name"]
+__all__ = ["check_schema", "field_schema", "fields_of", "placement", "resolve_schema", "schema_name"]
 
 # What a field holds: a value, one nested config class, or a keyed table of one.
 type Shape = tuple[Literal["value", "group", "table"], type | None]
+
+# What a dotted path LANDS ON inside a schema, which is a finer question than what a field holds — a
+# table and one of its entries are the same field:
+#   ("group", C)    a nested config-class field: one C, and the YAML block that fills it must name it
+#   ("entry", C)    one entry of a table of C: also a C, but which class it is was fixed by the table
+#   ("table", C)    the table itself: however many C the keys name, and no single class to fill
+#   ("value", None) a leaf — a scalar, a list, or a dict of plain values
+#   ("unknown", None) no such path in this schema (an unknown key, or one below a leaf)
+type Placement = tuple[Literal["group", "entry", "table", "value", "unknown"], type | None]
 
 
 # THE SCRIPT THAT WAS LAUNCHED IS `__main__`. A config class defined in the entry point itself lives in a
@@ -159,37 +169,68 @@ def resolve_schema(dotted: str) -> type:
     raise ValueError(f"`_schema: {dotted}` could not be imported — no such module or attribute")
 
 
-# The config class that belongs at `node` (a dotted path) inside `root`; `root` itself for the empty
-# path. A table is stepped through by naming one of its entries — `overrides.task.dreambooth` lands on
-# the table's value class — because an entry is a group and the table itself is not: it has no class of
-# its own to fill, only however many the keys name. Raises if the path does not land on a config class,
-# which is what a `defaults:` under a leaf field looks like.
-def field_schema(root: type, node: str) -> type:
-    current = root
+# Step a dotted path through `root` one key at a time, saying what each prefix lands on. A table is
+# stepped through by naming one of its entries — `overrides.task.dreambooth` lands on the table's value
+# class — because an entry is a group and the table itself is not: it has no class of its own to fill,
+# only however many the keys name. The walk stops at the first key it cannot place; nothing below a leaf
+# or an unknown key is a node of this schema.
+def _walk(root: type, node: str) -> Iterator[tuple[str, Placement]]:
+    current: type | None = root
     entry_of: type | None = None  # set when the last key landed on a table: the class its entries have
     walked: list[str] = []
     for key in [k for k in node.split(".") if k]:
         walked.append(key)
+        path = ".".join(walked)
         if entry_of is not None:  # this key is a table KEY, not a field name
             current, entry_of = entry_of, None
+            yield path, ("entry", current)
             continue
-        shapes = fields_of(current)
+        shapes = fields_of(current) if current is not None else {}
         if key not in shapes:
-            where = f"{schema_name(root)}.{'.'.join(walked[:-1])}" if len(walked) > 1 else schema_name(root)
-            raise ValueError(f"{where} has no field {key!r}")
+            yield path, ("unknown", None)
+            return
         kind, nested = shapes[key]
         if nested is None:
-            raise ValueError(
-                f"{schema_name(root)}.{'.'.join(walked)} is a value, not a nested config class — "
-                "only a group can be composed from a config file"
-            )
-        if kind == "table":
+            current = None
+            yield path, ("value", None)
+        elif kind == "table":
             entry_of = nested
+            yield path, ("table", nested)
         else:
             current = nested
-    if entry_of is not None:
+            yield path, ("group", nested)
+
+
+# What `node` (a dotted path) lands on inside `root` — see Placement. `root` itself for the empty path.
+# The non-raising half of field_schema, for a caller that wants to ASK rather than require.
+def placement(root: type, node: str) -> Placement:
+    last: Placement = ("group", root)
+    for _, where in _walk(root, node):
+        last = where
+    return last
+
+
+# The config class that belongs at `node` (a dotted path) inside `root`; `root` itself for the empty
+# path. Raises if the path does not land on a config class, which is what a `defaults:` under a leaf
+# field looks like.
+def field_schema(root: type, node: str) -> type:
+    current, kind = root, "group"
+    walked = ""
+    for path, (kind, cls) in _walk(root, node):
+        walked = path
+        if kind == "unknown":
+            parent, _, key = path.rpartition(".")
+            where = f"{schema_name(root)}.{parent}" if parent else schema_name(root)
+            raise ValueError(f"{where} has no field {key!r}")
+        if kind == "value":
+            raise ValueError(
+                f"{schema_name(root)}.{path} is a value, not a nested config class — "
+                "only a group can be composed from a config file"
+            )
+        current = cls if cls is not None else current
+    if kind == "table":
         raise ValueError(
-            f"{schema_name(root)}.{'.'.join(walked)} is a table of {schema_name(entry_of)}, not a config "
-            f"class — name one entry (`{'.'.join(walked)}.<key>`), since the table itself has no class to fill"
+            f"{schema_name(root)}.{walked} is a table of {schema_name(current)}, not a config "
+            f"class — name one entry (`{walked}.<key>`), since the table itself has no class to fill"
         )
     return current

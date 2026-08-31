@@ -19,9 +19,11 @@ model: llama
 tags: []
 resume_from: null
 optim:
+  _schema: fixtures.Optim
   lr: 0.0002
   warmup_steps: 100
 data:
+  _schema: fixtures.Data
   path: data/corpus.parquet
 """
 
@@ -339,7 +341,8 @@ def test_a_one_file_script_can_name_its_own_classes(tmp_path):
     # something. Launched for real, because that is the only way `__main__` is what it will be.
     (tmp_path / "solo.py").write_text(SOLO_SCRIPT, encoding="utf-8")
     (tmp_path / "solo.yaml").write_text(
-        "_schema: solo.SoloConfig\nmodel: llama\noptim:\n  lr: 0.5\n", encoding="utf-8"
+        "_schema: solo.SoloConfig\nmodel: llama\noptim:\n  _schema: solo.Optim\n  lr: 0.5\n",
+        encoding="utf-8",
     )
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
     argv = [sys.executable, "solo.py", "solo.yaml", "--run-dir", "run"]

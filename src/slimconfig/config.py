@@ -4,9 +4,13 @@
 # TWO KEYWORDS, AND THEY WORK AT ANY DEPTH.
 #
 #   _schema: <dotted.path.To.Class>   what this mapping fills. Required at the top of every config file
-#                                     (that is the discipline: a config file is written against a class,
-#                                     and says which). Legal deeper down too, to re-state what a nested
-#                                     block is — load_config checks every claim against the schema.
+#                                     AND at the top of every nested block that fills a config class of
+#                                     its own (that is the discipline: a mapping is written against a
+#                                     class, and says which). A table's entries are the one exception —
+#                                     their class was fixed by the table's declaration, not chosen by
+#                                     the entry. load_config checks every claim against the schema and
+#                                     is what enforces the requirement, since only it knows the schema;
+#                                     this module just records where each one was made.
 #   defaults: [<path>, ...]           what this mapping STARTS FROM. The listed files are composed in
 #                                     order and merged under the mapping's own keys, so the file that
 #                                     writes `defaults:` always wins on top of what it lists.
@@ -48,7 +52,7 @@ from typing import Any, NamedTuple, cast
 import yaml
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
-__all__ = ["Claim", "Composed", "compose", "load_mapping_yaml", "load_yaml"]
+__all__ = ["Block", "Claim", "Composed", "compose", "load_mapping_yaml", "load_yaml"]
 
 # The two reserved keys. Neither reaches the merged config: both are consumed here.
 SCHEMA_KEY = "_schema"
@@ -84,11 +88,24 @@ class Claim(NamedTuple):
     source: str    # the file it was read from, for the error message
 
 
+class Block(NamedTuple):
+    """One nested mapping a file wrote: where it sits, and which file wrote it.
+
+    Collected so load_config can hold every block that fills a config class to the same rule the top of
+    a file is held to — name the class. A block is recorded whatever it turns out to fill; only the
+    schema can say which ones are config classes, and the schema is not known here.
+    """
+
+    node: str      # dotted path from the root of the config being loaded (never "" — that is the file)
+    source: str    # the file that wrote it, for the error message
+
+
 class Composed(NamedTuple):
-    """A composed config and every `_schema:` claim made anywhere in it."""
+    """A composed config, every `_schema:` claim made anywhere in it, and every nested block written."""
 
     config: DictConfig
     claims: tuple[Claim, ...]
+    blocks: tuple[Block, ...]
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
@@ -107,8 +124,9 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
 # claim it makes is reported relative to that, so load_config can check it against the right class.
 def compose(path: str | Path, node: str = "") -> Composed:
     claims: list[Claim] = []
-    cfg = _compose_file(Path(path).resolve(), node, (), claims)
-    return Composed(cfg, tuple(claims))
+    blocks: list[Block] = []
+    cfg = _compose_file(Path(path).resolve(), node, (), claims, blocks)
+    return Composed(cfg, tuple(claims), tuple(blocks))
 
 
 def load_mapping_yaml(path: str) -> DictConfig:
@@ -137,7 +155,9 @@ def _load_one(path: Path) -> DictConfig:
 
 # One config FILE, composed at `node`. Every file must open by naming the class it fills: that is the
 # one thing a reader (and load_config) needs in order to know what the keys below it mean.
-def _compose_file(path: Path, node: str, visiting: tuple[Path, ...], claims: list[Claim]) -> DictConfig:
+def _compose_file(
+    path: Path, node: str, visiting: tuple[Path, ...], claims: list[Claim], blocks: list[Block]
+) -> DictConfig:
     if path in visiting:
         chain = " -> ".join(str(p) for p in (*visiting, path))
         raise ValueError(f"`{DEFAULTS_KEY}` cycle detected: {chain}")
@@ -147,14 +167,19 @@ def _compose_file(path: Path, node: str, visiting: tuple[Path, ...], claims: lis
             f"config file {str(path)!r} does not say which config class it fills: add a top-level "
             f"`{SCHEMA_KEY}: <dotted.path.To.Class>`"
         )
-    return _compose_node(loaded, node, str(path), (*visiting, path), claims)
+    return _compose_node(loaded, node, str(path), (*visiting, path), claims, blocks)
 
 
 # One MAPPING, composed at `node`: its `_schema:` recorded, its `defaults:` merged underneath it, and
 # the same done to each of its children. The mapping's own keys are merged last, so a file always wins
 # over what it lists — at every depth, not just the top.
 def _compose_node(
-    node_cfg: DictConfig, node: str, source: str, visiting: tuple[Path, ...], claims: list[Claim]
+    node_cfg: DictConfig,
+    node: str,
+    source: str,
+    visiting: tuple[Path, ...],
+    claims: list[Claim],
+    blocks: list[Block],
 ) -> DictConfig:
     declared = node_cfg.pop(SCHEMA_KEY, None)
     if declared is not None:
@@ -170,7 +195,9 @@ def _compose_node(
         # An entry resolves against the CWD (the project root scripts run from); an absolute entry
         # resolves to itself, since Path("/abs") wins over the cwd join.
         entry_path = (Path.cwd() / entry).resolve()
-        base = cast(DictConfig, OmegaConf.merge(base, _compose_file(entry_path, node, visiting, claims)))
+        base = cast(
+            DictConfig, OmegaConf.merge(base, _compose_file(entry_path, node, visiting, claims, blocks))
+        )
 
     # Which children are mappings, read WITHOUT resolving: a leaf may hold a `${...}` that only becomes
     # resolvable once everything is merged, and touching it here would raise on a config that is fine.
@@ -178,8 +205,9 @@ def _compose_node(
     for key, value in raw.items():
         if isinstance(value, dict):
             child_node = f"{node}.{key}" if node else str(key)
+            blocks.append(Block(child_node, source))
             node_cfg[key] = _compose_node(
-                cast(DictConfig, node_cfg[key]), child_node, source, visiting, claims
+                cast(DictConfig, node_cfg[key]), child_node, source, visiting, claims, blocks
             )
     return cast(DictConfig, OmegaConf.merge(base, node_cfg))
 
