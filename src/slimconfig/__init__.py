@@ -18,11 +18,11 @@
 #   * where a run WRITES is not part of its config: `run_dir` and `log` are the launcher's, from the
 #     command line or the script (runs.py).
 #
-# See config.py for the YAML loader, the `defaults:` composition that works at any depth, and the
+# See config.py for the YAML loader, the `_default:` composition that works at any depth, and the
 # ${now:...} / ${from_yaml:...} resolvers; and paths.py for the project-root rule relative paths
 # resolve against.
 
-from .config import Claim, Composed, compose, load_mapping_yaml, load_yaml
+from .config import Block, Claim, Composed, compose, load_mapping_yaml, load_yaml
 from .partials import is_partial, partial_of, stated
 from .paths import project_root, resolve_path
 from .runs import (
@@ -45,9 +45,10 @@ from .structured import (
     schema_of,
 )
 
-__version__ = "0.8.2"
+__version__ = "0.9.0"
 
 __all__ = [
+    "Block",
     "Claim",
     "Composed",
     "Spec",

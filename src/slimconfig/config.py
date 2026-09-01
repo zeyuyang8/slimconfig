@@ -1,4 +1,4 @@
-# slimconfig.config — the YAML layer: read a file, compose its `defaults:` chains, collect its
+# slimconfig.config — the YAML layer: read a file, compose the `_default:` chain behind it, collect its
 # `_schema:` claims.
 #
 # TWO KEYWORDS, AND THEY WORK AT ANY DEPTH.
@@ -11,11 +11,18 @@
 #                                     the entry. load_config checks every claim against the schema and
 #                                     is what enforces the requirement, since only it knows the schema;
 #                                     this module just records where each one was made.
-#   defaults: [<path>, ...]           what this mapping STARTS FROM. The listed files are composed in
-#                                     order and merged under the mapping's own keys, so the file that
-#                                     writes `defaults:` always wins on top of what it lists.
+#   _default: <path>                  the ONE file this mapping starts from. It is composed first and
+#                                     the mapping's own keys are merged on top, so the file that writes
+#                                     `_default:` always wins over what it inherits.
 #
-# `defaults:` inside a nested block is what makes a shared fragment reusable without it having to know
+# ONE PARENT, NOT A LIST. A config inherits a starting point and then says how it differs — that is a
+# chain, and a chain has an obvious reading order and an obvious winner at every key. A list of parents
+# has neither: which of them set the value you are looking at is answered by counting positions in a
+# list, in a file that may itself be inherited. Combining independent fragments is still possible and
+# still explicit — it just happens at the launch, where several config files may be passed at once and
+# the command line shows exactly what went in (slimconfig.runs).
+#
+# `_default:` inside a nested block is what makes a shared fragment reusable without it having to know
 # where it will be mounted: the fragment states its own fields at ITS top level, and the parent says
 # where they land.
 #
@@ -23,15 +30,15 @@
 #     _schema: myproject.train.Optim         _schema: myproject.train.TrainConfig
 #     lr: 2.0e-4                             model: llama-3-8b
 #     warmup_steps: 100                      optim:
-#     schedule: cosine                         defaults: [configs/optim/cosine.yaml]
+#     schedule: cosine                         _default: configs/optim/cosine.yaml
 #                                              lr: 1.0e-4          # this file wins
 #
-# Paths resolve relative to the CWD — the project root every script is run from — so one path convention
-# holds across a repo wherever the including file lives. Absolute paths resolve to themselves. Cycles are
-# caught and reported as the chain that closed them.
+# The path resolves relative to the CWD — the project root every script is run from — so one path
+# convention holds across a repo wherever the including file lives. An absolute path resolves to itself.
+# Cycles are caught and reported as the chain that closed them.
 #
 # The entry points:
-#   * compose         — a YAML path -> (DictConfig, the `_schema` claims in it and everything it pulled in)
+#   * compose         — a YAML path -> (DictConfig, the `_schema` claims in it and everything it inherited)
 #   * load_mapping_yaml — the same, keeping only the DictConfig
 #   * load_yaml       — plain PyYAML: a YAML file -> dict, no composition, no keywords. For reading a
 #                       file that is not a slimconfig config.
@@ -56,7 +63,7 @@ __all__ = ["Block", "Claim", "Composed", "compose", "load_mapping_yaml", "load_y
 
 # The two reserved keys. Neither reaches the merged config: both are consumed here.
 SCHEMA_KEY = "_schema"
-DEFAULTS_KEY = "defaults"
+DEFAULT_KEY = "_default"
 
 # ``${now:<strftime>}`` — interpolate the current time into any config value (Hydra-style). Registered
 # at import so every OmegaConf-loaded config has it. ``replace=True`` keeps re-import idempotent;
@@ -119,8 +126,8 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
     return cfg
 
 
-# Compose `path` and everything its `defaults:` chains pull in. `node` is where the file is being
-# mounted, as the keys that lead to it: () for a config loaded on its own, ("optim",) for one listed
+# Compose `path` and everything its `_default:` chain inherits. `node` is where the file is being
+# mounted, as the keys that lead to it: () for a config loaded on its own, ("optim",) for one named
 # under an `optim:` block — every claim it makes is reported relative to that, so load_config can check
 # it against the right class. Keys and not one dotted string, because a table key may contain a dot.
 def compose(path: str | Path, node: tuple[str, ...] = ()) -> Composed:
@@ -165,7 +172,7 @@ def _compose_file(
 ) -> DictConfig:
     if path in visiting:
         chain = " -> ".join(str(p) for p in (*visiting, path))
-        raise ValueError(f"`{DEFAULTS_KEY}` cycle detected: {chain}")
+        raise ValueError(f"`{DEFAULT_KEY}` cycle detected: {chain}")
     loaded = _load_one(path)
     if SCHEMA_KEY not in loaded:
         raise ValueError(
@@ -175,9 +182,9 @@ def _compose_file(
     return _compose_node(loaded, node, str(path), (*visiting, path), claims, blocks)
 
 
-# One MAPPING, composed at `node`: its `_schema:` recorded, its `defaults:` merged underneath it, and
+# One MAPPING, composed at `node`: its `_schema:` recorded, its `_default:` merged underneath it, and
 # the same done to each of its children. The mapping's own keys are merged last, so a file always wins
-# over what it lists — at every depth, not just the top.
+# over what it inherits — at every depth, not just the top.
 def _compose_node(
     node_cfg: DictConfig,
     node: tuple[str, ...],
@@ -195,14 +202,13 @@ def _compose_node(
             )
         claims.append(Claim(node, declared, source))
 
-    base: DictConfig = OmegaConf.create({})  # type: ignore[assignment]
-    for entry in _defaults_of(node_cfg, node, source):
-        # An entry resolves against the CWD (the project root scripts run from); an absolute entry
-        # resolves to itself, since Path("/abs") wins over the cwd join.
-        entry_path = (Path.cwd() / entry).resolve()
-        base = cast(
-            DictConfig, OmegaConf.merge(base, _compose_file(entry_path, node, visiting, claims, blocks))
-        )
+    # The path resolves against the CWD (the project root scripts are run from); an absolute path
+    # resolves to itself, since Path("/abs") wins over the cwd join.
+    parent = _default_of(node_cfg, node, source)
+    base = (
+        _compose_file((Path.cwd() / parent).resolve(), node, visiting, claims, blocks)
+        if parent is not None else None
+    )
 
     # Which children are mappings, read WITHOUT resolving: a leaf may hold a `${...}` that only becomes
     # resolvable once everything is merged, and touching it here would raise on a config that is fine.
@@ -214,24 +220,21 @@ def _compose_node(
             node_cfg[key] = _compose_node(
                 cast(DictConfig, node_cfg[key]), child_node, source, visiting, claims, blocks
             )
-    return cast(DictConfig, OmegaConf.merge(base, node_cfg))
+    return node_cfg if base is None else cast(DictConfig, OmegaConf.merge(base, node_cfg))
 
 
-# The `defaults:` list of one mapping, popped and validated.
-def _defaults_of(node_cfg: DictConfig, node: tuple[str, ...], source: str) -> list[str]:
-    defaults = node_cfg.pop(DEFAULTS_KEY, None)
-    if defaults is None:
-        return []
+# The `_default:` path of one mapping, popped and validated. A list is the mistake worth naming: it is
+# what every other config library takes here, and taking one file is the whole point of this one.
+def _default_of(node_cfg: DictConfig, node: tuple[str, ...], source: str) -> str | None:
+    parent = node_cfg.pop(DEFAULT_KEY, None)
+    if parent is None or isinstance(parent, str):
+        return parent
     where = f"{source!r}" + (f" (under `{'.'.join(node)}`)" if node else "")
-    if not isinstance(defaults, ListConfig):
-        raise ValueError(
-            f"config file {where}: `{DEFAULTS_KEY}` must be a list of yaml paths, "
-            f"got {type(defaults).__name__}"
-        )
-    for entry in defaults:
-        if not isinstance(entry, str):
-            raise ValueError(
-                f"config file {where}: each `{DEFAULTS_KEY}` entry must be a string path, "
-                f"got {type(entry).__name__}: {entry!r}"
-            )
-    return [str(e) for e in defaults]
+    listed = (
+        " Pass independent files at the launch instead: they merge in the order given, and the command"
+        " line then shows what went in." if isinstance(parent, ListConfig) else ""
+    )
+    raise ValueError(
+        f"config file {where}: `{DEFAULT_KEY}` must be ONE yaml path (a string), got "
+        f"{type(parent).__name__}: {parent!r}.{listed}"
+    )

@@ -17,7 +17,7 @@ Four rules, enforced at load time:
 * **Where a run writes is not part of its config.** `run_dir` and `log` are the launcher's, from the
   command line or the script.
 
-Plus what a research/experiment runner actually needs: `defaults:` composition at any depth, one
+Plus what a research/experiment runner actually needs: `_default:` composition at any depth, one
 launcher, and a run folder — holding the config, the log, and the results of one run.
 
 ## Install
@@ -109,7 +109,7 @@ class Sweep:
 ```
 
 A table needs no `default_factory` — its entries do not exist until a config file names their keys —
-and a `defaults:` mounts on one *entry* (`axes.lr`), never on the table itself, which has no single
+and a `_default:` mounts on one *entry* (`axes.lr`), never on the table itself, which has no single
 class to fill.
 
 Mind the difference when a later spec overrides an earlier one. Mappings merge **key by key**, which is
@@ -143,24 +143,30 @@ reads back only the fields that layer actually set, as a plain dict, which is wh
 merges. An unset field stays `MISSING` rather than becoming `None`, so a layer that writes
 `resume_from: null` still overwrites — `null` is a value, silence is not.
 
-## Share configs with `defaults:`
+## Share configs with `_default:`
 
-Any mapping — the file's top level *or any block inside it* — may carry a `defaults:` list of paths,
-meaning "this block starts from these files". The listed files are composed in order and the mapping
-that wrote `defaults:` wins on top; composition is recursive, and cycles are caught.
+Any mapping — the file's top level *or any block inside it* — may carry a `_default:`, the ONE path it
+starts from. That file is composed first and the mapping that wrote `_default:` wins on top;
+composition is recursive, and cycles are caught.
 
 ```yaml
 # configs/optim/cosine.yaml        # configs/train_7b.yaml
 _schema: train.Optim               _schema: train.TrainConfig
-lr: 2.0e-4                         defaults: [configs/train.yaml]
+lr: 2.0e-4                         _default: configs/train.yaml
 warmup_steps: 100                  model: llama-3-7b
                                    optim:
-                                     defaults: [configs/optim/cosine.yaml]
+                                     _default: configs/optim/cosine.yaml
                                      lr: 1.0e-4      # this file wins
 ```
 
+One parent, not a list. A config inherits a starting point and then says how it differs — that is a
+chain, with an obvious reading order and an obvious winner at every key. A list of parents has
+neither: which of them set the value in front of you is answered by counting positions in a list, in a
+file that may itself be inherited. Combining independent fragments is still explicit, it just happens
+at the launch — `run` takes several config files at once, so the command line shows what went in.
+
 A block that mounts a fragment needs no `_schema:` of its own, as `optim:` above does not: the fragment
-it lists already names the class, at that node. The rule is that every block filling a config class is
+it names already names the class, at that node. The rule is that every block filling a config class is
 named — once, by whoever is in a position to say it.
 
 Because the mount point is named by the *parent*, a shared fragment states its own fields at its own

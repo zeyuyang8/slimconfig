@@ -1,4 +1,4 @@
-# The YAML layer: load_yaml / load_mapping_yaml / compose, the `_schema:` and `defaults:` keywords, and
+# The YAML layer: load_yaml / load_mapping_yaml / compose, the `_schema:` and `_default:` keywords, and
 # the resolvers. What the claims MEAN is checked against a schema in test_structured.py.
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ def test_load_yaml_rejects_invalid_yaml(tmp_path, write):
         load_yaml(path)
 
 
-def test_load_mapping_yaml_without_defaults(tmp_path, write):
+def test_load_mapping_yaml_without_default(tmp_path, write):
     path = write(tmp_path / "a.yaml", "a: 1\nnested: {x: 2}\n")
     cfg = load_mapping_yaml(path)
     assert cfg.a == 1
@@ -83,65 +83,67 @@ def test_the_schema_line_must_be_a_string(tmp_path, write):
         load_mapping_yaml(write(tmp_path / "a.yaml", "_schema: [a, b]\na: 1\n"))
 
 
-# ── `defaults:` composition ──────────────────────────────────────────────────
+# ── `_default:` composition ──────────────────────────────────────────────────
 
 
-def test_defaults_current_file_wins_and_merges_deeply(tmp_path, monkeypatch, write):
+def test_default_current_file_wins_and_merges_deeply(tmp_path, monkeypatch, write):
     monkeypatch.chdir(tmp_path)
     write(tmp_path / "base.yaml", "a: 1\nb: 2\nnested: {x: 1, y: 1}\n")
-    child = write(tmp_path / "child.yaml", "defaults: [base.yaml]\nb: 20\nnested: {y: 20}\n")
+    child = write(tmp_path / "child.yaml", "_default: base.yaml\nb: 20\nnested: {y: 20}\n")
     cfg = load_mapping_yaml(child)
     assert cfg.a == 1  # inherited
     assert cfg.b == 20  # overridden
     assert (cfg.nested.x, cfg.nested.y) == (1, 20)  # deep merge, not replacement
-    assert "defaults" not in cfg
+    assert "_default" not in cfg
 
 
-def test_defaults_later_entry_wins_over_earlier(tmp_path, monkeypatch, write):
+def test_a_config_inherits_one_file_not_a_list(tmp_path, monkeypatch, write):
+    # Two parents have no reading order: which of them set the value you are looking at is answered by
+    # counting positions in a list. Combining independent files is a LAUNCH, not an inheritance.
     monkeypatch.chdir(tmp_path)
-    write(tmp_path / "one.yaml", "a: 1\nshared: from_one\n")
-    write(tmp_path / "two.yaml", "b: 2\nshared: from_two\n")
-    child = write(tmp_path / "child.yaml", "defaults: [one.yaml, two.yaml]\n")
-    cfg = load_mapping_yaml(child)
-    assert (cfg.a, cfg.b, cfg.shared) == (1, 2, "from_two")
+    write(tmp_path / "one.yaml", "a: 1\n")
+    write(tmp_path / "two.yaml", "b: 2\n")
+    child = write(tmp_path / "child.yaml", "_default: [one.yaml, two.yaml]\n")
+    with pytest.raises(ValueError, match=r"must be ONE yaml path.*at the launch"):
+        load_mapping_yaml(child)
 
 
-def test_defaults_compose_recursively(tmp_path, monkeypatch, write):
+def test_default_compose_recursively(tmp_path, monkeypatch, write):
     monkeypatch.chdir(tmp_path)
     write(tmp_path / "grand.yaml", "a: 1\n")
-    write(tmp_path / "parent.yaml", "defaults: [grand.yaml]\nb: 2\n")
-    child = write(tmp_path / "child.yaml", "defaults: [parent.yaml]\nc: 3\n")
+    write(tmp_path / "parent.yaml", "_default: grand.yaml\nb: 2\n")
+    child = write(tmp_path / "child.yaml", "_default: parent.yaml\nc: 3\n")
     cfg = load_mapping_yaml(child)
     assert (cfg.a, cfg.b, cfg.c) == (1, 2, 3)
 
 
-def test_defaults_resolve_against_cwd_not_the_including_file(tmp_path, monkeypatch, write):
+def test_default_resolve_against_cwd_not_the_including_file(tmp_path, monkeypatch, write):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "configs").mkdir()
     write(tmp_path / "configs" / "base.yaml", "a: 1\n")
-    # The `defaults` entry is written from the project root, even though the file that carries it
+    # The `_default` entry is written from the project root, even though the file that carries it
     # sits one directory down next to base.yaml.
-    child = write(tmp_path / "configs" / "child.yaml", "defaults: [configs/base.yaml]\nb: 2\n")
+    child = write(tmp_path / "configs" / "child.yaml", "_default: configs/base.yaml\nb: 2\n")
     cfg = load_mapping_yaml(child)
     assert (cfg.a, cfg.b) == (1, 2)
 
 
-def test_defaults_cycle_is_detected(tmp_path, monkeypatch, write):
+def test_default_cycle_is_detected(tmp_path, monkeypatch, write):
     monkeypatch.chdir(tmp_path)
-    write(tmp_path / "a.yaml", "defaults: [b.yaml]\n")
-    write(tmp_path / "b.yaml", "defaults: [a.yaml]\n")
-    with pytest.raises(ValueError, match="`defaults` cycle detected"):
+    write(tmp_path / "a.yaml", "_default: b.yaml\n")
+    write(tmp_path / "b.yaml", "_default: a.yaml\n")
+    with pytest.raises(ValueError, match="`_default` cycle detected"):
         load_mapping_yaml(str(tmp_path / "a.yaml"))
 
 
 @pytest.mark.parametrize(
     ("body", "match"),
     [
-        ("defaults: base.yaml\n", "must be a list of yaml paths"),
-        ("defaults: [{a: 1}]\n", "must be a string path"),
+        ("_default: {a: 1}\n", "must be ONE yaml path"),
+        ("_default: 3\n", "must be ONE yaml path"),
     ],
 )
-def test_defaults_shape_is_validated(tmp_path, monkeypatch, write, body, match):
+def test_default_shape_is_validated(tmp_path, monkeypatch, write, body, match):
     monkeypatch.chdir(tmp_path)
     write(tmp_path / "base.yaml", "a: 1\n")
     path = write(tmp_path / "child.yaml", body)
@@ -149,13 +151,13 @@ def test_defaults_shape_is_validated(tmp_path, monkeypatch, write, body, match):
         load_mapping_yaml(path)
 
 
-# ── `defaults:` at any depth ─────────────────────────────────────────────────
+# ── `_default:` at any depth ─────────────────────────────────────────────────
 
 
-def test_defaults_inside_a_block_mounts_the_file_there(tmp_path, monkeypatch, write):
+def test_default_inside_a_block_mounts_the_file_there(tmp_path, monkeypatch, write):
     monkeypatch.chdir(tmp_path)
     write(tmp_path / "cosine.yaml", "lr: 2.0e-4\nwarmup_steps: 100\n", schema="fixtures.Optim")
-    child = write(tmp_path / "train.yaml", "model: llama\noptim:\n  defaults: [cosine.yaml]\n")
+    child = write(tmp_path / "train.yaml", "model: llama\noptim:\n  _default: cosine.yaml\n")
     cfg = load_mapping_yaml(child)
     # The fragment states its fields at ITS top level; the parent says where they land.
     assert (cfg.optim.lr, cfg.optim.warmup_steps) == (2e-4, 100)
@@ -165,7 +167,7 @@ def test_defaults_inside_a_block_mounts_the_file_there(tmp_path, monkeypatch, wr
 def test_a_block_wins_over_what_it_starts_from(tmp_path, monkeypatch, write):
     monkeypatch.chdir(tmp_path)
     write(tmp_path / "cosine.yaml", "lr: 2.0e-4\nwarmup_steps: 100\n", schema="fixtures.Optim")
-    body = "model: llama\noptim:\n  defaults: [cosine.yaml]\n  lr: 1.0e-4\n"
+    body = "model: llama\noptim:\n  _default: cosine.yaml\n  lr: 1.0e-4\n"
     cfg = load_mapping_yaml(write(tmp_path / "train.yaml", body))
     assert (cfg.optim.lr, cfg.optim.warmup_steps) == (1e-4, 100)
 
@@ -173,7 +175,7 @@ def test_a_block_wins_over_what_it_starts_from(tmp_path, monkeypatch, write):
 def test_a_mounted_fragment_reports_its_claim_at_the_mount_point(tmp_path, monkeypatch, write):
     monkeypatch.chdir(tmp_path)
     write(tmp_path / "cosine.yaml", "lr: 2.0e-4\n", schema="fixtures.Optim")
-    child = write(tmp_path / "train.yaml", "optim:\n  defaults: [cosine.yaml]\n")
+    child = write(tmp_path / "train.yaml", "optim:\n  _default: cosine.yaml\n")
     assert [(c.node, c.schema) for c in compose(child).claims] == [
         ((), "fixtures.TrainConfig"),
         (("optim",), "fixtures.Optim"),
@@ -183,31 +185,31 @@ def test_a_mounted_fragment_reports_its_claim_at_the_mount_point(tmp_path, monke
 def test_one_fragment_can_be_mounted_at_two_places(tmp_path, monkeypatch, write):
     monkeypatch.chdir(tmp_path)
     write(tmp_path / "shared.yaml", "path: data/x\n", schema="fixtures.Data")
-    body = "data:\n  defaults: [shared.yaml]\nother:\n  defaults: [shared.yaml]\n"
+    body = "data:\n  _default: shared.yaml\nother:\n  _default: shared.yaml\n"
     cfg = load_mapping_yaml(write(tmp_path / "train.yaml", body))
     assert cfg.data.path == cfg.other.path == "data/x"  # the same file, twice, is not a cycle
 
 
-def test_a_mounted_fragment_composes_its_own_defaults(tmp_path, monkeypatch, write):
+def test_a_mounted_fragment_composes_its_own_default(tmp_path, monkeypatch, write):
     monkeypatch.chdir(tmp_path)
     write(tmp_path / "base_optim.yaml", "lr: 1.0\nwarmup_steps: 5\n", schema="fixtures.Optim")
-    write(tmp_path / "cosine.yaml", "defaults: [base_optim.yaml]\nlr: 2.0\n", schema="fixtures.Optim")
-    cfg = load_mapping_yaml(write(tmp_path / "train.yaml", "optim:\n  defaults: [cosine.yaml]\n"))
+    write(tmp_path / "cosine.yaml", "_default: base_optim.yaml\nlr: 2.0\n", schema="fixtures.Optim")
+    cfg = load_mapping_yaml(write(tmp_path / "train.yaml", "optim:\n  _default: cosine.yaml\n"))
     assert (cfg.optim.lr, cfg.optim.warmup_steps) == (2.0, 5)
 
 
-def test_a_nested_defaults_cycle_is_detected(tmp_path, monkeypatch, write):
+def test_a_nested_default_cycle_is_detected(tmp_path, monkeypatch, write):
     monkeypatch.chdir(tmp_path)
-    write(tmp_path / "a.yaml", "optim:\n  defaults: [b.yaml]\n")
-    write(tmp_path / "b.yaml", "defaults: [a.yaml]\n", schema="fixtures.Optim")
-    with pytest.raises(ValueError, match="`defaults` cycle detected"):
+    write(tmp_path / "a.yaml", "optim:\n  _default: b.yaml\n")
+    write(tmp_path / "b.yaml", "_default: a.yaml\n", schema="fixtures.Optim")
+    with pytest.raises(ValueError, match="`_default` cycle detected"):
         load_mapping_yaml(str(tmp_path / "a.yaml"))
 
 
-def test_a_nested_defaults_shape_error_names_the_block(tmp_path, monkeypatch, write):
+def test_a_nested_default_shape_error_names_the_block(tmp_path, monkeypatch, write):
     monkeypatch.chdir(tmp_path)
-    path = write(tmp_path / "a.yaml", "optim:\n  defaults: base.yaml\n")
-    with pytest.raises(ValueError, match=r"under `optim`.*must be a list"):
+    path = write(tmp_path / "a.yaml", "optim:\n  _default: [base.yaml]\n")
+    with pytest.raises(ValueError, match=r"under `optim`.*must be ONE yaml path"):
         load_mapping_yaml(path)
 
 
@@ -234,10 +236,10 @@ def test_from_yaml_resolver_reads_another_config(tmp_path, monkeypatch, write):
     assert load_mapping_yaml(path).tag == "wikitext"
 
 
-def test_from_yaml_resolver_follows_the_referenced_files_defaults(tmp_path, monkeypatch, write):
+def test_from_yaml_resolver_follows_the_referenced_files_default(tmp_path, monkeypatch, write):
     monkeypatch.chdir(tmp_path)
     write(tmp_path / "base_limits.yaml", "admit: 4\n")
-    write(tmp_path / "limits.yaml", "defaults:\n  - base_limits.yaml\nadmit: 32\n")
+    write(tmp_path / "limits.yaml", "_default: base_limits.yaml\nadmit: 32\n")
     # The referenced file is read through the composing loader, so it composes first and its own value
     # wins over the default it pulls in — the resolver sees 32, not 4.
     path = write(tmp_path / "a.yaml", "concurrency: ${from_yaml:limits.yaml,admit}\n")
@@ -257,5 +259,5 @@ def test_an_unresolvable_interpolation_does_not_break_composition(tmp_path, monk
     # A leaf may name a key that only exists once everything is merged. Composition must not touch it.
     monkeypatch.chdir(tmp_path)
     write(tmp_path / "base.yaml", "root: /data\n")
-    child = write(tmp_path / "child.yaml", "defaults: [base.yaml]\nnested:\n  out: ${root}/x\n")
+    child = write(tmp_path / "child.yaml", "_default: base.yaml\nnested:\n  out: ${root}/x\n")
     assert load_mapping_yaml(child).nested.out == "/data/x"

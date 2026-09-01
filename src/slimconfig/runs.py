@@ -267,6 +267,8 @@ def _positional_count(function: Callable[..., Any]) -> int:
 
 # The config FILE this launch was given — the first spec that names one. "" when the config came from
 # overrides or a mapping alone, so a run-dir function that names a folder after it can say so itself.
+# FIRST, not last: with several files the first is the one the reader typed as "what this run is", the
+# rest being what it was combined with. A launch where that is not true should pass `--run-dir` and say.
 def _primary_config(specs: list[Spec]) -> str:
     return next((s for s in specs if isinstance(s, str) and os.path.isfile(s)), "")
 
@@ -275,7 +277,8 @@ def _usage(extra: str = "") -> NoReturn:
     script = os.path.basename(sys.argv[0]) or "run.py"
     raise SystemExit(
         (extra + "\n" if extra else "")
-        + f"usage: {script} <config.yaml> [key=value ...] [{RUN_DIR_FLAG} PATH] [{LOG_FLAG} NAME | {NO_LOG_FLAG}]"
+        + f"usage: {script} <config.yaml> [more.yaml ...] [key=value ...] "
+        + f"[{RUN_DIR_FLAG} PATH] [{LOG_FLAG} NAME | {NO_LOG_FLAG}]"
     )
 
 
@@ -284,7 +287,11 @@ def _usage(extra: str = "") -> NoReturn:
 #              and optionally the run folder (a second argument annotated `str`), and returns this
 #              process's exit status (None -> 0).
 #   config   — the YAML file to load that class from. Omitted, it comes off the command line
-#              (`<config.yaml> [key=value ...]`), which is how a stepN script is normally launched.
+#              (`<config.yaml> [more.yaml ...] [key=value ...]`), which is how a stepN script is normally
+#              launched. SEVERAL files may be named, merged left to right — that is where independent
+#              fragments are combined, since a file inherits only one (`_default:` in config.py). The
+#              difference matters: a chain is a property of the files and lives in them, a combination is
+#              a property of this launch and shows up in its argv (and so in its metadata.json).
 #   run_dir  — the folder this run owns: a path, or a function returning one — of the loaded config, and
 #              of the config file itself if it takes a second argument (`lambda cfg, path: ...`).
 #              `--run-dir` on the command line wins over it; one of the two must say.

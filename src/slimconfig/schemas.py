@@ -25,7 +25,7 @@
 # parent's own namespace, so the YAML cannot say where a value came from and two mixins can silently
 # collide on a name. A nested field gives the group a name in the class AND the same name in the YAML,
 # which is what makes a hierarchical config readable — and what lets a shared fragment be mounted at
-# exactly one place (see the `defaults:` rule in config.py).
+# exactly one place (see the `_default:` rule in config.py).
 #
 # NAMING A CLASS FROM YAML. Every config file states the class it fills, by dotted import path:
 #     _schema: myproject.train.OptimConfig
@@ -38,6 +38,7 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import sys
+import types
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
@@ -112,8 +113,6 @@ def _shape_of(annotation: Any) -> Shape:
             return ("table", value)
         return ("value", None)  # a dict of plain values is a leaf
     # Optional[X] / X | None arrive as a Union; a union of anything else is not a group.
-    import types
-
     if origin in (Union, types.UnionType):
         inner = [a for a in get_args(annotation) if a is not type(None)]
         if len(inner) == 1:
@@ -226,7 +225,7 @@ def placement(root: type, node: Node) -> Placement:
 
 
 # The config class that belongs at `node` inside `root`; `root` itself for the empty path. Raises if the
-# path does not land on a config class, which is what a `defaults:` under a leaf field looks like.
+# path does not land on a config class, which is what a `_default:` under a leaf field looks like.
 def field_schema(root: type, node: Node) -> type:
     current, kind = root, "group"
     walked: tuple[str, ...] = ()

@@ -78,10 +78,10 @@ def test_load_config_rejects_a_wrongly_typed_value(tmp_path, write):
         load_config(fixtures.TrainConfig, [path])
 
 
-def test_load_config_composes_defaults(tmp_path, monkeypatch, write):
+def test_load_config_composes_the_default(tmp_path, monkeypatch, write):
     monkeypatch.chdir(tmp_path)
     write(tmp_path / "base.yaml", FULL)
-    child = write(tmp_path / "child.yaml", "defaults: [base.yaml]\nmodel: qwen\n")
+    child = write(tmp_path / "child.yaml", "_default: base.yaml\nmodel: qwen\n")
     cfg = load_config(fixtures.TrainConfig, [child])
     assert (cfg.model, cfg.optim.warmup_steps) == ("qwen", 100)
 
@@ -103,7 +103,7 @@ def test_a_file_written_for_another_class_is_rejected(tmp_path, write):
 def test_a_fragment_mounted_at_the_wrong_block_is_rejected(tmp_path, monkeypatch, write):
     monkeypatch.chdir(tmp_path)
     write(tmp_path / "cosine.yaml", "lr: 2.0e-4\nwarmup_steps: 5\n", schema="fixtures.Optim")
-    child = write(tmp_path / "train.yaml", "data:\n  defaults: [cosine.yaml]\n")
+    child = write(tmp_path / "train.yaml", "data:\n  _default: cosine.yaml\n")
     with pytest.raises(ValueError, match=r"says it fills fixtures.Optim.*`data`.*fixtures.Data"):
         load_config(fixtures.TrainConfig, [child])
 
@@ -112,7 +112,7 @@ def test_a_fragment_may_declare_a_base_of_the_target(tmp_path, monkeypatch, writ
     # A base states a SUBSET of the fields — which is exactly what a shared fragment does.
     monkeypatch.chdir(tmp_path)
     write(tmp_path / "lr.yaml", "lr: 3.0e-4\n", schema="fixtures.LrOnly")
-    body = FULL.replace("  lr: 0.0002\n", "  defaults: [lr.yaml]\n")
+    body = FULL.replace("  lr: 0.0002\n", "  _default: lr.yaml\n")
     cfg = load_config(fixtures.TrainConfig, [write(tmp_path / "train.yaml", body)])
     assert (cfg.optim.lr, cfg.optim.warmup_steps) == (pytest.approx(3e-4), 100)
 
@@ -122,7 +122,7 @@ def test_a_fragment_may_not_declare_a_subclass_of_the_target(tmp_path, monkeypat
     monkeypatch.chdir(tmp_path)
     write(tmp_path / "opt.yaml", "lr: 1.0\nwarmup_steps: 5\n", schema="fixtures.Optim")
     child = write(
-        tmp_path / "loose.yaml", "optim:\n  defaults: [opt.yaml]\n", schema="fixtures.LooseConfig"
+        tmp_path / "loose.yaml", "optim:\n  _default: opt.yaml\n", schema="fixtures.LooseConfig"
     )
     with pytest.raises(ValueError, match=r"says it fills fixtures.Optim.*`optim`.*fixtures.LrOnly"):
         load_config(fixtures.LooseConfig, [child])
@@ -188,11 +188,11 @@ def test_a_table_key_may_contain_a_dot(tmp_path, write):
 
 
 def test_a_block_that_only_mounts_a_fragment_is_named_by_the_fragment(tmp_path, monkeypatch, write):
-    # `optim:` holds nothing but a `defaults:`, and the file it lists declares the class AT that node.
+    # `optim:` holds nothing but a `_default:`, and the file it lists declares the class AT that node.
     monkeypatch.chdir(tmp_path)
     write(tmp_path / "opt.yaml", "lr: 1.0\nwarmup_steps: 5\n", schema="fixtures.Optim")
     body = FULL.replace(
-        "  _schema: fixtures.Optim\n  lr: 0.0002\n  warmup_steps: 100\n", "  defaults: [opt.yaml]\n"
+        "  _schema: fixtures.Optim\n  lr: 0.0002\n  warmup_steps: 100\n", "  _default: opt.yaml\n"
     )
     cfg = load_config(fixtures.TrainConfig, [write(tmp_path / "train.yaml", body)])
     assert (cfg.optim.lr, cfg.optim.warmup_steps) == (1.0, 5)

@@ -15,7 +15,7 @@
 #   * unknown keys are rejected (OmegaConf struct mode).
 #
 # YAML files are read via slimconfig.config.compose, so any mapping in one — at any depth — may carry
-# `defaults: [<path>, ...]` to start from shared files, and the file that lists them wins on top.
+# `_default: <path>` to start from a shared file, and the file that names it wins on top.
 
 from __future__ import annotations
 
@@ -25,21 +25,12 @@ from typing import Any, cast
 
 from omegaconf import DictConfig, OmegaConf
 
-from .config import Block, Claim, compose
+from .config import Block, Claim, Composed, compose
 from .partials import is_partial
 from .schemas import check_schema, field_schema, fields_of, placement, resolve_schema, schema_name
 
 # One config source: a YAML file path, a `dotted.key=value` override, or a ready-made mapping.
 type Spec = str | Mapping[str, Any] | DictConfig
-
-
-class _Merged:
-    """The merged specs, the `_schema:` claims the files among them made, and the blocks they wrote."""
-
-    def __init__(self, config: DictConfig, claims: tuple[Claim, ...], blocks: tuple[Block, ...]) -> None:
-        self.config = config
-        self.claims = claims
-        self.blocks = blocks
 
 
 # Dotted paths of every leaf field still unset, walking the SCHEMA rather than the merged node: a
@@ -84,7 +75,10 @@ def _instantiate[T](node: DictConfig, schema: type[T]) -> T:
     return schema(**kwargs)
 
 
-def _merge(specs: list[Spec]) -> _Merged:
+# Several specs merged into one, reported exactly as compose reports one file: a Composed is "a config,
+# every claim made anywhere in it, and every block written in it", and that is as true of five specs as
+# of one — a launch that names several files is one config assembled from all of them.
+def _merge(specs: list[Spec]) -> Composed:
     merged = OmegaConf.create()
     claims: list[Claim] = []
     blocks: list[Block] = []
@@ -102,7 +96,7 @@ def _merge(specs: list[Spec]) -> _Merged:
             raise FileNotFoundError(
                 f"config spec {spec!r} is neither a file nor a key=value override"
             )
-    return _Merged(cast(DictConfig, merged), tuple(claims), tuple(blocks))
+    return Composed(cast(DictConfig, merged), tuple(claims), tuple(blocks))
 
 
 # Merge YAML files, dotted key=value overrides, and already-built mappings into one unstructured
