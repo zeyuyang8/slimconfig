@@ -13,6 +13,12 @@
 # class declares them. A run dir that is a FUNCTION of the config — an identity-addressed output tree —
 # is passed as a function, which is one rule in code instead of the same interpolation copied into every
 # config file that lands there. Both are recorded in the folder's metadata.json either way.
+#
+# Three objects hold the three things a launch is made of, so `run` itself reads as the four steps it
+# takes and each rule has a name:
+#   * Entrypoint — the routine being launched: its config class, and whether it also wants the folder.
+#   * Launch     — what the command line said: the config specs, and where this run writes.
+#   * RunFolder  — the folder itself: the snapshot in it, and the log tee'd into it.
 
 from __future__ import annotations
 
@@ -31,7 +37,7 @@ from typing import Any, NoReturn, cast, get_type_hints
 from omegaconf import DictConfig, OmegaConf
 
 from .config import SCHEMA_KEY
-from .schemas import fields_of, schema_name
+from .schemas import Field, Schema
 from .structured import Spec, load_config
 
 __all__ = ["run", "start_run", "tee_stdout"]
@@ -46,6 +52,9 @@ NO_LOG_FLAG = "--no-log"
 # script says "the folder is named after the config that produced it", the one naming rule that keeps a
 # result and the file that asked for it findable from each other.
 type RunDir = str | Callable[..., str]
+
+
+# ── the snapshot ─────────────────────────────────────────────────────────────
 
 
 def _git(*args: str) -> subprocess.CompletedProcess:
@@ -86,18 +95,18 @@ def _as_dictconfig(config: Any) -> DictConfig:
 # What the SCHEMA says a field holds only tells us where a block WOULD be; the value has to be one. A
 # partial (`partial_of`) leaves fields unset, and an unset group or table comes out of to_container as
 # the string "???" — there is no block there to name, so it is written through as it is.
-def _stamp(node: Mapping[str, Any], cls: type, tag: bool = True) -> dict[str, Any]:
-    out: dict[str, Any] = {SCHEMA_KEY: schema_name(cls)} if tag else {}
-    shapes = fields_of(cls)
+def _stamp(node: Mapping[str, Any], schema: Schema, tag: bool = True) -> dict[str, Any]:
+    out: dict[str, Any] = {SCHEMA_KEY: schema.name} if tag else {}
+    fields = schema.fields
     for key, value in node.items():
-        kind, nested = shapes.get(key, ("value", None))
+        kind, nested = fields.get(key, Field("value", None))
         if nested is None or not isinstance(value, Mapping):
             out[key] = value
         elif kind == "group":
-            out[key] = _stamp(value, nested)
+            out[key] = _stamp(value, Schema(nested))
         else:  # a table: the entries are not tagged, but any group INSIDE one still is
             out[key] = {
-                k: _stamp(v, nested, tag=False) if isinstance(v, Mapping) else v
+                k: _stamp(v, Schema(nested), tag=False) if isinstance(v, Mapping) else v
                 for k, v in value.items()
             }
     return out
@@ -110,7 +119,7 @@ def _snapshot(config: Any) -> str:
     if not (dataclasses.is_dataclass(config) and not isinstance(config, type)):
         return OmegaConf.to_yaml(node, resolve=True)
     container = OmegaConf.to_container(node, resolve=True, enum_to_str=True)
-    return OmegaConf.to_yaml(OmegaConf.create(_stamp(cast(Mapping, container), type(config))))
+    return OmegaConf.to_yaml(OmegaConf.create(_stamp(cast(Mapping, container), Schema(type(config)))))
 
 
 # Open the run's folder and record what produced it. Writes two files:
@@ -142,6 +151,9 @@ def start_run(run_dir: str, config: Any) -> str:
     except (OSError, TypeError, ValueError) as e:
         print(f"[slimconfig] could not snapshot the config into {run_dir} ({e})")
     return run_dir
+
+
+# ── the log ──────────────────────────────────────────────────────────────────
 
 
 class _Tee:
@@ -185,92 +197,140 @@ def tee_stdout(path: str, banner: str | None = None) -> Iterator[str]:
             sys.stdout = real
 
 
-# Open `run_dir`, snapshot `cfg` into it, and tee stdout to `<run_dir>/<log>` (log None for no log).
-@contextlib.contextmanager
-def _open_run(run_dir: str, log: str | None, cfg: Any) -> Iterator[str]:
-    start_run(run_dir, cfg)
-    if not log:
-        yield run_dir
-        return
-    stamp = datetime.now(UTC).isoformat(timespec="seconds")
-    banner = f"\n═══ {stamp} · {' '.join(sys.argv)} ═══"
-    with tee_stdout(os.path.join(run_dir, log), banner=banner):
-        yield run_dir
+# ── the launch ───────────────────────────────────────────────────────────────
 
 
-# What `function` takes: its config class, read off the first parameter's annotation, and whether it
-# also wants the run folder. A function IS its config — one annotated argument, so the entry point names
-# the routine and the schema comes with it — plus an OPTIONAL second argument, `run_dir: str`, for a
-# routine that writes into the folder (which is most of them).
-def _signature_of(function: Callable[..., int | None]) -> tuple[type, bool]:
-    if not callable(function):
-        raise TypeError(f"run() takes a function of one config argument, not {type(function).__name__}")
-    name = getattr(function, "__qualname__", repr(function))
-    params = [
-        p for p in inspect.signature(function).parameters.values()
-        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
-    ]
-    if not 1 <= len(params) <= 2:
-        raise TypeError(
-            f"{name} must take its config, and optionally the run folder — one or two arguments, "
-            f"not {len(params)}"
-        )
-    hints = get_type_hints(function)
-    schema = hints.get(params[0].name)
-    if not (isinstance(schema, type) and dataclasses.is_dataclass(schema)):
-        raise TypeError(
-            f"{name}'s argument `{params[0].name}` must be annotated with its config class "
-            f"(a dataclass), got {schema!r}"
-        )
-    if len(params) == 2 and hints.get(params[1].name) is not str:
-        raise TypeError(
-            f"{name}'s second argument `{params[1].name}` is the run folder and must be annotated "
-            f"`str`, got {hints.get(params[1].name)!r}"
-        )
-    return schema, len(params) == 2
+@dataclasses.dataclass(frozen=True, slots=True)
+class _RunFolder:
+    """The folder one run owns: where it is, and what it logs to (None for no log)."""
+
+    path: str
+    log: str | None
+
+    # Snapshot `cfg` into the folder and tee stdout to the log inside it, for the length of the block.
+    @contextlib.contextmanager
+    def open(self, cfg: Any) -> Iterator[str]:
+        start_run(self.path, cfg)
+        if not self.log:
+            yield self.path
+            return
+        stamp = datetime.now(UTC).isoformat(timespec="seconds")
+        banner = f"\n═══ {stamp} · {' '.join(sys.argv)} ═══"
+        with tee_stdout(os.path.join(self.path, self.log), banner=banner):
+            yield self.path
 
 
-# Pull `--run-dir` / `--log` / `--no-log` out of an argv tail, returning what is left (the config specs)
-# and whichever of the two the command line set. `--no-log` is how a launch says "no log file" over a
-# script that asked for one — every rank of a distributed launch would otherwise append to one path.
-def _split_argv(argv: list[str]) -> tuple[list[str], str | None, str | None, bool]:
-    specs: list[str] = []
-    taken: dict[str, str] = {}
-    no_log = False
-    i = 0
-    while i < len(argv):
-        arg = argv[i]
-        i += 1
-        if arg == NO_LOG_FLAG:
-            no_log = True
-            continue
-        flag = next((f for f in (RUN_DIR_FLAG, LOG_FLAG) if arg == f or arg.startswith(f + "=")), None)
-        if flag is None:
-            specs.append(arg)
-            continue
-        if arg != flag:
-            taken[flag] = arg[len(flag) + 1 :]
-            continue
-        if i >= len(argv):
-            raise SystemExit(f"{flag} needs a value")
-        taken[flag], i = argv[i], i + 1
-    return specs, taken.get(RUN_DIR_FLAG), taken.get(LOG_FLAG), no_log
+@dataclasses.dataclass(frozen=True, slots=True)
+class _Entrypoint:
+    """The routine `run` was given, and what its signature says it wants.
+
+    A function IS its config — one annotated argument, so the entry point names the routine and the
+    schema comes with it — plus an OPTIONAL second argument, `run_dir: str`, for a routine that writes
+    into the folder (which is most of them).
+    """
+
+    function: Callable[..., int | None]
+    schema: type
+    wants_run_dir: bool
+
+    @classmethod
+    def of(cls, function: Callable[..., int | None]) -> _Entrypoint:
+        if not callable(function):
+            raise TypeError(f"run() takes a function of one config argument, not {type(function).__name__}")
+        name = getattr(function, "__qualname__", repr(function))
+        params = _positional(function, keyword_only=True)
+        if not 1 <= len(params) <= 2:
+            raise TypeError(
+                f"{name} must take its config, and optionally the run folder — one or two arguments, "
+                f"not {len(params)}"
+            )
+        hints = get_type_hints(function)
+        schema = hints.get(params[0].name)
+        if not (isinstance(schema, type) and dataclasses.is_dataclass(schema)):
+            raise TypeError(
+                f"{name}'s argument `{params[0].name}` must be annotated with its config class "
+                f"(a dataclass), got {schema!r}"
+            )
+        if len(params) == 2 and hints.get(params[1].name) is not str:
+            raise TypeError(
+                f"{name}'s second argument `{params[1].name}` is the run folder and must be annotated "
+                f"`str`, got {hints.get(params[1].name)!r}"
+            )
+        return cls(function, schema, len(params) == 2)
+
+    def __call__(self, cfg: Any, run_dir: str) -> int | None:
+        return self.function(cfg, run_dir) if self.wants_run_dir else self.function(cfg)
 
 
-# How many arguments a run-dir function wants: the config, or the config and the file it came from.
-def _positional_count(function: Callable[..., Any]) -> int:
-    return len([
-        p for p in inspect.signature(function).parameters.values()
-        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-    ])
+@dataclasses.dataclass(frozen=True, slots=True)
+class _Launch:
+    """What the command line said: the config specs, and whichever of the run dir / log it set.
+
+    `--no-log` is how a launch says "no log file" over a script that asked for one — every rank of a
+    distributed launch would otherwise append to one path.
+    """
+
+    specs: list[str]
+    run_dir: str | None
+    log: str | None
+    no_log: bool
+
+    # Pull `--run-dir` / `--log` / `--no-log` out of an argv tail; what is left is the config specs.
+    @classmethod
+    def parse(cls, argv: list[str]) -> _Launch:
+        specs: list[str] = []
+        taken: dict[str, str] = {}
+        no_log = False
+        i = 0
+        while i < len(argv):
+            arg = argv[i]
+            i += 1
+            if arg == NO_LOG_FLAG:
+                no_log = True
+                continue
+            flag = next((f for f in (RUN_DIR_FLAG, LOG_FLAG) if arg == f or arg.startswith(f + "=")), None)
+            if flag is None:
+                specs.append(arg)
+                continue
+            if arg != flag:
+                taken[flag] = arg[len(flag) + 1 :]
+                continue
+            if i >= len(argv):
+                raise SystemExit(f"{flag} needs a value")
+            taken[flag], i = argv[i], i + 1
+        return cls(specs, taken.get(RUN_DIR_FLAG), taken.get(LOG_FLAG), no_log)
+
+    # The folder this run owns, and the log inside it. The command line wins over what the script asked
+    # for, in both cases. A run dir the script gave as a FUNCTION is called here — with the loaded
+    # config, and with the config file this launch was given if it takes a second argument.
+    def folder(self, script_run_dir: RunDir | None, script_log: str | None, cfg: Any) -> _RunFolder:
+        where: RunDir | None = self.run_dir if self.run_dir is not None else script_run_dir
+        if callable(where):
+            wants_file = len(_positional(where)) > 1
+            where = where(cfg, self.primary_config()) if wants_file else where(cfg)
+        if not where:
+            _usage(
+                "this run has nowhere to write: pass `--run-dir PATH`, or give the script a run dir "
+                "(`run(fn, run_dir=...)`) — every run owns a folder holding its config, its log and its results"
+            )
+        log = None if self.no_log else (self.log if self.log is not None else script_log)
+        return _RunFolder(where, log)
+
+    # The config FILE this launch was given — the first spec that names one. "" when the config came
+    # from overrides alone, so a run-dir function that names a folder after it can say so itself.
+    # FIRST, not last: with several files the first is the one the reader typed as "what this run is",
+    # the rest being what it was combined with. A launch where that is not true should pass `--run-dir`.
+    def primary_config(self) -> str:
+        return next((s for s in self.specs if os.path.isfile(s)), "")
 
 
-# The config FILE this launch was given — the first spec that names one. "" when the config came from
-# overrides or a mapping alone, so a run-dir function that names a folder after it can say so itself.
-# FIRST, not last: with several files the first is the one the reader typed as "what this run is", the
-# rest being what it was combined with. A launch where that is not true should pass `--run-dir` and say.
-def _primary_config(specs: list[Spec]) -> str:
-    return next((s for s in specs if isinstance(s, str) and os.path.isfile(s)), "")
+# The positional parameters of a function — plus the keyword-only ones where those count too (a config
+# argument may be spelled either way; a run-dir function's cannot, since `run` passes them positionally).
+def _positional(function: Callable[..., Any], keyword_only: bool = False) -> list[inspect.Parameter]:
+    kinds = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    if keyword_only:
+        kinds += (inspect.Parameter.KEYWORD_ONLY,)
+    return [p for p in inspect.signature(function).parameters.values() if p.kind in kinds]
 
 
 def _usage(extra: str = "") -> NoReturn:
@@ -320,25 +380,16 @@ def run(
     log: str | None = None,
     **overrides: Any,
 ) -> NoReturn:
-    schema, wants_run_dir = _signature_of(function)
-    argv_specs, cli_run_dir, cli_log, no_log = _split_argv(list(sys.argv[1:]))
-    specs: list[Spec] = [config] if config is not None else cast(list[Spec], argv_specs)
-    if not specs:
+    entry = _Entrypoint.of(function)
+    launch = _Launch.parse(list(sys.argv[1:]))
+    if config is not None:
+        launch = dataclasses.replace(launch, specs=[config])
+    if not launch.specs:
         _usage()
-    specs += [f"{key}={value}" for key, value in overrides.items()]
+    specs = cast(list[Spec], [*launch.specs, *(f"{key}={value}" for key, value in overrides.items())])
 
-    cfg = load_config(schema, specs)
-
-    where = cli_run_dir if cli_run_dir is not None else run_dir
-    if callable(where):
-        where = where(cfg, _primary_config(specs)) if _positional_count(where) > 1 else where(cfg)
-    if not where:
-        _usage(
-            "this run has nowhere to write: pass `--run-dir PATH`, or give the script a run dir "
-            "(`run(fn, run_dir=...)`) — every run owns a folder holding its config, its log and its results"
-        )
-    log_name = None if no_log else (cli_log if cli_log is not None else log)
-
-    with _open_run(where, log_name, cfg):
-        status = function(cfg, where) if wants_run_dir else function(cfg)
+    cfg = load_config(entry.schema, specs)
+    folder = launch.folder(run_dir, log, cfg)
+    with folder.open(cfg):
+        status = entry(cfg, folder.path)
     raise SystemExit(status)

@@ -326,6 +326,11 @@ A *node* is where something sits in a config, spelled as the sequence of keys �
 way to write one by hand, but it cannot say what a key with a dot *in* it is: only whoever walked the
 mapping knows whether `flux.1-dev` is one key or two, so `compose` reports the keys it descended.
 
+The last five are the shorthand; the questions themselves belong to one object,
+`slimconfig.schemas.Schema`, which wraps a config class — `Schema(cls).name` / `.fields` /
+`.check()` / `.at(node)` / `.require(node)`, and `Schema.resolve(dotted)`. Reach for it when you are
+asking a schema more than one thing.
+
 A *spec* is a YAML file path, a `dotted.key=value` string, or a ready-made mapping/`DictConfig` —
 so a caller can merge values it computed at runtime under the same "later wins" rule. A mapping spec
 needs no `_schema:`: values a routine computed are code, and code is already typed.

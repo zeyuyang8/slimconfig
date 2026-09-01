@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 from omegaconf import OmegaConf
 
-from slimconfig import compose, load_mapping_yaml, load_yaml
+from slimconfig import Composed, compose, load_mapping_yaml, load_yaml
 
 
 def test_load_yaml_returns_plain_dict(tmp_path, write):
@@ -261,3 +261,31 @@ def test_an_unresolvable_interpolation_does_not_break_composition(tmp_path, monk
     write(tmp_path / "base.yaml", "root: /data\n")
     child = write(tmp_path / "child.yaml", "_default: base.yaml\nnested:\n  out: ${root}/x\n")
     assert load_mapping_yaml(child).nested.out == "/data/x"
+
+
+# ── Composed, the value a composition is ─────────────────────────────────────
+
+
+def test_composed_merges_configs_claims_and_blocks_together(tmp_path, monkeypatch, write):
+    # A launch that names several files is ONE config assembled from all of them, so merging two
+    # compositions merges all three of the things a composition is — and later still wins.
+    monkeypatch.chdir(tmp_path)
+    a = compose(write(tmp_path / "a.yaml", "model: llama\noptim:\n  _schema: fixtures.Optim\n  lr: 1\n"))
+    b = compose(write(tmp_path / "b.yaml", "model: qwen\n"))
+    both = a.merge(b)
+    assert both.config.model == "qwen"
+    assert both.config.optim.lr == 1
+    assert both.claims == a.claims + b.claims
+    assert both.blocks == a.blocks + b.blocks
+
+
+def test_composed_of_a_mapping_claims_nothing():
+    # Values a caller computed are code, and code is already typed: no `_schema:` to record, no block.
+    computed = Composed.of({"model": "llama"})
+    assert computed.config.model == "llama"
+    assert computed.claims == () and computed.blocks == ()
+
+
+def test_the_empty_composition_is_the_identity_of_merge(tmp_path, write):
+    one = compose(write(tmp_path / "a.yaml", "model: llama\n"))
+    assert Composed.empty().merge(one) == one

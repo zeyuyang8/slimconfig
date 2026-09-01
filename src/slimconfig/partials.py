@@ -36,7 +36,7 @@ from typing import Any, get_type_hints
 
 from omegaconf import MISSING
 
-from .schemas import fields_of, schema_name
+from .schemas import Schema, schema_name
 
 __all__ = ["is_partial", "partial_of", "stated"]
 
@@ -55,7 +55,7 @@ def _partial(cls: type, name: str, module: str, seen: tuple[type, ...]) -> type:
         raise TypeError(f"config class {schema_name(cls)} contains itself; it has no partial")
     hints = get_type_hints(cls)
     specs: list[Any] = []
-    for field_name, (kind, group) in fields_of(cls).items():
+    for field_name, (kind, group) in Schema(cls).fields.items():
         if kind == "group" and group is not None:
             sub = _partial(group, f"{group.__name__}Part", module, (*seen, cls))
             specs.append((field_name, sub, dataclasses.field(default_factory=sub)))
@@ -71,7 +71,7 @@ def _partial(cls: type, name: str, module: str, seen: tuple[type, ...]) -> type:
 # Give every nested partial a name that says where it hangs, and hang it there — so `CellPart.GSSPart`
 # both reads right in an error message and resolves as a dotted path.
 def _attach(part: type, prefix: str) -> None:
-    for kind, group in fields_of(part).values():
+    for kind, group in Schema(part).fields.values():
         if kind == "group" and group is not None and is_partial(group) and "." not in group.__qualname__:
             group.__qualname__ = f"{prefix}.{group.__name__}"
             setattr(part, group.__name__, group)
@@ -101,7 +101,7 @@ def stated(layer: Any) -> dict[str, Any]:
     if not (dataclasses.is_dataclass(cls) and not isinstance(layer, type)):
         raise TypeError(f"stated() takes a config instance, got {layer!r}")
     out: dict[str, Any] = {}
-    for name, (kind, group) in fields_of(cls).items():
+    for name, (kind, group) in Schema(cls).fields.items():
         value = getattr(layer, name)
         if isinstance(value, str) and value == MISSING:
             continue

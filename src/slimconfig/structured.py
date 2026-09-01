@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import reduce
 from pathlib import Path
 from typing import Any, cast
 
@@ -27,7 +28,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from .config import Block, Claim, Composed, compose
 from .partials import is_partial
-from .schemas import check_schema, field_schema, fields_of, placement, resolve_schema, schema_name
+from .schemas import Schema
 
 # One config source: a YAML file path, a `dotted.key=value` override, or a ready-made mapping.
 type Spec = str | Mapping[str, Any] | DictConfig
@@ -37,11 +38,11 @@ type Spec = str | Mapping[str, Any] | DictConfig
 # partial subtree is allowed to be unset, and only the schema says which subtrees those are. (Merging a
 # partial's node onto a complete one promotes the result's runtime type to the partial, so asking the
 # node "are you partial?" would answer yes for a config that is genuinely incomplete.)
-def _missing_fields(cfg: DictConfig, schema: type, prefix: str = "") -> list[str]:
-    if is_partial(schema):  # a layer, not a run: saying nothing is what it is for
+def _missing_fields(cfg: DictConfig, schema: Schema, prefix: str = "") -> list[str]:
+    if is_partial(schema.cls):  # a layer, not a run: saying nothing is what it is for
         return []
     missing: list[str] = []
-    for name, (kind, nested) in fields_of(schema).items():
+    for name, (kind, nested) in schema.fields.items():
         if OmegaConf.is_missing(cfg, name):
             missing.append(prefix + name)
             continue
@@ -49,10 +50,12 @@ def _missing_fields(cfg: DictConfig, schema: type, prefix: str = "") -> list[str
         if nested is None or value is None:
             continue
         if kind == "group":
-            missing.extend(_missing_fields(cast(DictConfig, value), nested, f"{prefix}{name}."))
+            missing.extend(_missing_fields(cast(DictConfig, value), Schema(nested), f"{prefix}{name}."))
         else:  # a table: each entry is checked like the group it is
             missing.extend(
-                m for key in value for m in _missing_fields(value[key], nested, f"{prefix}{name}.{key}.")
+                m
+                for key in value
+                for m in _missing_fields(value[key], Schema(nested), f"{prefix}{name}.{key}.")
             )
     return missing
 
@@ -62,7 +65,7 @@ def _missing_fields(cfg: DictConfig, schema: type, prefix: str = "") -> list[str
 # is ours — an unset field is simply not passed, and the class's own MISSING default stands.
 def _instantiate[T](node: DictConfig, schema: type[T]) -> T:
     kwargs: dict[str, Any] = {}
-    for name, (kind, nested) in fields_of(cast(type, schema)).items():
+    for name, (kind, nested) in Schema(cast(type, schema)).fields.items():
         if OmegaConf.is_missing(node, name):
             continue
         value = node[name]
@@ -75,28 +78,23 @@ def _instantiate[T](node: DictConfig, schema: type[T]) -> T:
     return schema(**kwargs)
 
 
+# One spec, composed on its own. A FILE goes through the whole YAML layer (its `_default:` chain, its
+# claims, its blocks); anything else is code and carries none of those.
+def _composed(spec: Spec) -> Composed:
+    if isinstance(spec, Mapping | DictConfig):
+        return Composed.of(spec)
+    if Path(spec).is_file():
+        return compose(spec)
+    if "=" in spec:
+        return Composed.of(OmegaConf.from_dotlist([spec]))
+    raise FileNotFoundError(f"config spec {spec!r} is neither a file nor a key=value override")
+
+
 # Several specs merged into one, reported exactly as compose reports one file: a Composed is "a config,
 # every claim made anywhere in it, and every block written in it", and that is as true of five specs as
 # of one — a launch that names several files is one config assembled from all of them.
 def _merge(specs: list[Spec]) -> Composed:
-    merged = OmegaConf.create()
-    claims: list[Claim] = []
-    blocks: list[Block] = []
-    for spec in specs:
-        if isinstance(spec, Mapping | DictConfig):
-            merged = OmegaConf.merge(merged, spec)
-        elif Path(spec).is_file():
-            composed = compose(spec)
-            claims.extend(composed.claims)
-            blocks.extend(composed.blocks)
-            merged = OmegaConf.merge(merged, composed.config)
-        elif "=" in spec:
-            merged = OmegaConf.merge(merged, OmegaConf.from_dotlist([spec]))
-        else:
-            raise FileNotFoundError(
-                f"config spec {spec!r} is neither a file nor a key=value override"
-            )
-    return Composed(cast(DictConfig, merged), tuple(claims), tuple(blocks))
+    return reduce(Composed.merge, map(_composed, specs), Composed.empty())
 
 
 # Merge YAML files, dotted key=value overrides, and already-built mappings into one unstructured
@@ -111,15 +109,15 @@ def merge_specs(specs: list[Spec]) -> DictConfig:
 # the class its block was written for; the block's real class comes from walking the schema. They agree
 # when the claim is that class or a base of it — a base states a subset of the fields, which is exactly
 # what a shared fragment does.
-def _check_claims(schema: type, claims: tuple[Claim, ...]) -> None:
+def _check_claims(schema: Schema, claims: tuple[Claim, ...]) -> None:
     for claim in claims:
-        target = field_schema(schema, claim.node)
-        declared = resolve_schema(claim.schema)
-        if not issubclass(target, declared):
+        target = schema.require(claim.node)
+        declared = Schema.resolve(claim.schema)
+        if not issubclass(target.cls, declared.cls):
             where = f"`{'.'.join(claim.node)}`" if claim.node else "the top level"
             raise ValueError(
                 f"config file {claim.source!r} says it fills {claim.schema}, but it is being merged onto "
-                f"{where} of {schema_name(schema)}, which is {schema_name(target)}"
+                f"{where} of {schema.name}, which is {target.name}"
             )
 
 
@@ -132,20 +130,21 @@ def _check_claims(schema: type, claims: tuple[Claim, ...]) -> None:
 # fixed, once, by the table's own declaration — every entry of a `dict[Method, CellPart]` is a CellPart
 # and cannot be anything else, so an entry naming it adds a line that can be wrong and never informative.
 # A table itself and a leaf have no class to name at all, and a claim on either is already an error
-# (field_schema). An unknown node is left alone: OmegaConf's struct check reports it far better than a
+# (Schema.require). An unknown node is left alone: OmegaConf's struct check reports it far better than a
 # missing-`_schema` complaint would.
-def _check_declared(schema: type, blocks: tuple[Block, ...], claims: tuple[Claim, ...]) -> None:
+def _check_declared(schema: Schema, blocks: tuple[Block, ...], claims: tuple[Claim, ...]) -> None:
     declared = {claim.node for claim in claims}
     for block in blocks:
         if block.node in declared:
             continue
-        kind, cls = placement(schema, block.node)
+        kind, cls = schema.at(block.node)
         if kind != "group" or cls is None:
             continue
+        name = Schema(cls).name
         raise ValueError(
             f"config file {block.source!r} writes the block `{'.'.join(block.node)}`, which fills the "
-            f"config class {schema_name(cls)}, without saying so: add `_schema: {schema_name(cls)}` at "
-            f"the top of that block. Every mapping that fills a config class names the class it fills."
+            f"config class {name}, without saying so: add `_schema: {name}` at the top of that block. "
+            f"Every mapping that fills a config class names the class it fills."
         )
 
 
@@ -154,15 +153,16 @@ def _check_declared(schema: type, blocks: tuple[Block, ...], claims: tuple[Claim
 # ValueError if a file names the wrong class or any leaf is left unset, FileNotFoundError for a bad
 # spec, and OmegaConf errors for unknown keys / type mismatches.
 def load_config[T](schema: type[T], specs: list[Spec]) -> T:
-    check_schema(cast(type, schema))
-    merged_specs = _merge(specs)
-    _check_claims(cast(type, schema), merged_specs.claims)
-    _check_declared(cast(type, schema), merged_specs.blocks, merged_specs.claims)
-    merged = OmegaConf.merge(OmegaConf.structured(schema), merged_specs.config)
-    missing = _missing_fields(cast(DictConfig, merged), cast(type, schema))
+    root = Schema(cast(type, schema))
+    root.check()
+    composed = _merge(specs)
+    _check_claims(root, composed.claims)
+    _check_declared(root, composed.blocks, composed.claims)
+    merged = cast(DictConfig, OmegaConf.merge(OmegaConf.structured(schema), composed.config))
+    missing = _missing_fields(merged, root)
     if missing:
-        raise ValueError(f"{schema.__name__} is missing required field(s): {', '.join(missing)}")
-    return _instantiate(cast(DictConfig, merged), schema)
+        raise ValueError(f"{root.cls.__name__} is missing required field(s): {', '.join(missing)}")
+    return _instantiate(merged, schema)
 
 
 # Return `key` (dotted paths allowed) from the merged specs, or None — without validation, so a caller
@@ -179,4 +179,4 @@ def schema_of(path: str) -> type:
     root = next((c for c in claims if not c.node), None)
     if root is None:  # compose() rejects a file with no top-level `_schema:`, so this cannot happen
         raise ValueError(f"config file {path!r} declares no top-level `_schema:`")
-    return resolve_schema(root.schema)
+    return Schema.resolve(root.schema).cls

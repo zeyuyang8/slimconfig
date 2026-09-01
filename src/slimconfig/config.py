@@ -52,6 +52,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple, cast
@@ -108,11 +109,35 @@ class Block(NamedTuple):
 
 
 class Composed(NamedTuple):
-    """A composed config, every `_schema:` claim made anywhere in it, and every nested block written."""
+    """A composed config, every `_schema:` claim made anywhere in it, and every nested block written.
+
+    This is what one config file composes to — and, merged, what a whole launch composes to: several
+    files and overlays are still one config, assembled from all of them, and its claims and blocks are
+    theirs put together (see `merge`).
+    """
 
     config: DictConfig
     claims: tuple[Claim, ...]
     blocks: tuple[Block, ...]
+
+    # Nothing composed yet: the identity of `merge`.
+    @classmethod
+    def empty(cls) -> Composed:
+        return cls(OmegaConf.create(), (), ())
+
+    # A mapping that is not a config file — a `key=value` override, or values a caller computed. It
+    # makes no claims and writes no blocks: those are things a FILE is held to, and this is code.
+    @classmethod
+    def of(cls, config: Mapping[str, Any] | DictConfig) -> Composed:
+        return cls(cast(DictConfig, OmegaConf.create(config)), (), ())
+
+    # `other` on top of this one — later wins, key by key, exactly as OmegaConf merges.
+    def merge(self, other: Composed) -> Composed:
+        return Composed(
+            cast(DictConfig, OmegaConf.merge(self.config, other.config)),
+            self.claims + other.claims,
+            self.blocks + other.blocks,
+        )
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
@@ -124,21 +149,6 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
     if not isinstance(cfg, dict):
         raise ValueError(f"Config {path} did not parse to a mapping (got {type(cfg).__name__})")
     return cfg
-
-
-# Compose `path` and everything its `_default:` chain inherits. `node` is where the file is being
-# mounted, as the keys that lead to it: () for a config loaded on its own, ("optim",) for one named
-# under an `optim:` block — every claim it makes is reported relative to that, so load_config can check
-# it against the right class. Keys and not one dotted string, because a table key may contain a dot.
-def compose(path: str | Path, node: tuple[str, ...] = ()) -> Composed:
-    claims: list[Claim] = []
-    blocks: list[Block] = []
-    cfg = _compose_file(Path(path).resolve(), node, (), claims, blocks)
-    return Composed(cfg, tuple(claims), tuple(blocks))
-
-
-def load_mapping_yaml(path: str) -> DictConfig:
-    return compose(path).config
 
 
 def _load_one(path: Path) -> DictConfig:
@@ -161,80 +171,102 @@ def _load_one(path: Path) -> DictConfig:
     return loaded
 
 
-# One config FILE, composed at `node`. Every file must open by naming the class it fills: that is the
-# one thing a reader (and load_config) needs in order to know what the keys below it mean.
-def _compose_file(
-    path: Path,
-    node: tuple[str, ...],
-    visiting: tuple[Path, ...],
-    claims: list[Claim],
-    blocks: list[Block],
-) -> DictConfig:
-    if path in visiting:
-        chain = " -> ".join(str(p) for p in (*visiting, path))
-        raise ValueError(f"`{DEFAULT_KEY}` cycle detected: {chain}")
-    loaded = _load_one(path)
-    if SCHEMA_KEY not in loaded:
-        raise ValueError(
-            f"config file {str(path)!r} does not say which config class it fills: add a top-level "
-            f"`{SCHEMA_KEY}: <dotted.path.To.Class>`"
-        )
-    return _compose_node(loaded, node, str(path), (*visiting, path), claims, blocks)
+class _Composer:
+    """ONE composition in progress.
 
+    A composition is a recursive walk — down the `_default:` chain of a file, and down the nested blocks
+    of each mapping in it — and everything it produces besides the config itself is accumulated across
+    the whole walk: the `_schema:` claims, the blocks written, and the chain of files currently open (so
+    a cycle can be named). Holding those on the walker keeps them out of every signature: `file` and
+    `mapping` take only what differs between calls — WHICH mapping, and WHERE it is being mounted.
+    """
 
-# One MAPPING, composed at `node`: its `_schema:` recorded, its `_default:` merged underneath it, and
-# the same done to each of its children. The mapping's own keys are merged last, so a file always wins
-# over what it inherits — at every depth, not just the top.
-def _compose_node(
-    node_cfg: DictConfig,
-    node: tuple[str, ...],
-    source: str,
-    visiting: tuple[Path, ...],
-    claims: list[Claim],
-    blocks: list[Block],
-) -> DictConfig:
-    declared = node_cfg.pop(SCHEMA_KEY, None)
-    if declared is not None:
+    def __init__(self) -> None:
+        self.claims: list[Claim] = []
+        self.blocks: list[Block] = []
+        self.visiting: tuple[Path, ...] = ()  # the `_default:` chain currently open, outermost first
+
+    @classmethod
+    def compose(cls, path: Path, node: tuple[str, ...]) -> Composed:
+        self = cls()
+        return Composed(self.file(path, node), tuple(self.claims), tuple(self.blocks))
+
+    # One config FILE, composed at `node`. Every file must open by naming the class it fills: that is
+    # the one thing a reader (and load_config) needs in order to know what the keys below it mean.
+    def file(self, path: Path, node: tuple[str, ...]) -> DictConfig:
+        if path in self.visiting:
+            chain = " -> ".join(str(p) for p in (*self.visiting, path))
+            raise ValueError(f"`{DEFAULT_KEY}` cycle detected: {chain}")
+        loaded = _load_one(path)
+        if SCHEMA_KEY not in loaded:
+            raise ValueError(
+                f"config file {str(path)!r} does not say which config class it fills: add a top-level "
+                f"`{SCHEMA_KEY}: <dotted.path.To.Class>`"
+            )
+        outer, self.visiting = self.visiting, (*self.visiting, path)
+        try:
+            return self.mapping(loaded, node, str(path))
+        finally:
+            self.visiting = outer
+
+    # One MAPPING, composed at `node`: its `_schema:` recorded, its `_default:` merged underneath it,
+    # and the same done to each of its children. The mapping's own keys are merged last, so a file
+    # always wins over what it inherits — at every depth, not just the top.
+    def mapping(self, node_cfg: DictConfig, node: tuple[str, ...], source: str) -> DictConfig:
+        self._claim(node_cfg, node, source)
+
+        # The path resolves against the CWD (the project root scripts are run from); an absolute path
+        # resolves to itself, since Path("/abs") wins over the cwd join.
+        parent = self._default(node_cfg, node, source)
+        base = self.file((Path.cwd() / parent).resolve(), node) if parent is not None else None
+
+        # Which children are mappings, read WITHOUT resolving: a leaf may hold a `${...}` that only
+        # becomes resolvable once everything is merged, and touching it here would raise on a config
+        # that is fine.
+        raw = cast(dict, OmegaConf.to_container(node_cfg, resolve=False))
+        for key, value in raw.items():
+            if isinstance(value, dict):
+                child = (*node, str(key))
+                self.blocks.append(Block(child, source))
+                node_cfg[key] = self.mapping(cast(DictConfig, node_cfg[key]), child, source)
+        return node_cfg if base is None else cast(DictConfig, OmegaConf.merge(base, node_cfg))
+
+    # The `_schema:` line of one mapping, popped and recorded.
+    def _claim(self, node_cfg: DictConfig, node: tuple[str, ...], source: str) -> None:
+        declared = node_cfg.pop(SCHEMA_KEY, None)
+        if declared is None:
+            return
         if not isinstance(declared, str):
             raise ValueError(
                 f"config file {source!r}: `{SCHEMA_KEY}` must be a dotted import path (a string), "
                 f"got {type(declared).__name__}"
             )
-        claims.append(Claim(node, declared, source))
+        self.claims.append(Claim(node, declared, source))
 
-    # The path resolves against the CWD (the project root scripts are run from); an absolute path
-    # resolves to itself, since Path("/abs") wins over the cwd join.
-    parent = _default_of(node_cfg, node, source)
-    base = (
-        _compose_file((Path.cwd() / parent).resolve(), node, visiting, claims, blocks)
-        if parent is not None else None
-    )
-
-    # Which children are mappings, read WITHOUT resolving: a leaf may hold a `${...}` that only becomes
-    # resolvable once everything is merged, and touching it here would raise on a config that is fine.
-    raw = cast(dict, OmegaConf.to_container(node_cfg, resolve=False))
-    for key, value in raw.items():
-        if isinstance(value, dict):
-            child_node = (*node, str(key))
-            blocks.append(Block(child_node, source))
-            node_cfg[key] = _compose_node(
-                cast(DictConfig, node_cfg[key]), child_node, source, visiting, claims, blocks
-            )
-    return node_cfg if base is None else cast(DictConfig, OmegaConf.merge(base, node_cfg))
+    # The `_default:` path of one mapping, popped and validated. A list is the mistake worth naming: it
+    # is what every other config library takes here, and taking one file is the whole point of this one.
+    def _default(self, node_cfg: DictConfig, node: tuple[str, ...], source: str) -> str | None:
+        parent = node_cfg.pop(DEFAULT_KEY, None)
+        if parent is None or isinstance(parent, str):
+            return parent
+        where = f"{source!r}" + (f" (under `{'.'.join(node)}`)" if node else "")
+        listed = (
+            " Pass independent files at the launch instead: they merge in the order given, and the command"
+            " line then shows what went in." if isinstance(parent, ListConfig) else ""
+        )
+        raise ValueError(
+            f"config file {where}: `{DEFAULT_KEY}` must be ONE yaml path (a string), got "
+            f"{type(parent).__name__}: {parent!r}.{listed}"
+        )
 
 
-# The `_default:` path of one mapping, popped and validated. A list is the mistake worth naming: it is
-# what every other config library takes here, and taking one file is the whole point of this one.
-def _default_of(node_cfg: DictConfig, node: tuple[str, ...], source: str) -> str | None:
-    parent = node_cfg.pop(DEFAULT_KEY, None)
-    if parent is None or isinstance(parent, str):
-        return parent
-    where = f"{source!r}" + (f" (under `{'.'.join(node)}`)" if node else "")
-    listed = (
-        " Pass independent files at the launch instead: they merge in the order given, and the command"
-        " line then shows what went in." if isinstance(parent, ListConfig) else ""
-    )
-    raise ValueError(
-        f"config file {where}: `{DEFAULT_KEY}` must be ONE yaml path (a string), got "
-        f"{type(parent).__name__}: {parent!r}.{listed}"
-    )
+# Compose `path` and everything its `_default:` chain inherits. `node` is where the file is being
+# mounted, as the keys that lead to it: () for a config loaded on its own, ("optim",) for one named
+# under an `optim:` block — every claim it makes is reported relative to that, so load_config can check
+# it against the right class. Keys and not one dotted string, because a table key may contain a dot.
+def compose(path: str | Path, node: tuple[str, ...] = ()) -> Composed:
+    return _Composer.compose(Path(path).resolve(), node)
+
+
+def load_mapping_yaml(path: str) -> DictConfig:
+    return compose(path).config
