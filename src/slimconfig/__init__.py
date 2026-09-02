@@ -9,11 +9,12 @@
 #         run(main)
 #
 # Four rules:
-#   * a config class is a @dataclass of LEAVES, NESTED CONFIG CLASSES and TABLES of one (`dict[K, C]`) —
-#     groups are composed as fields, not inherited as mixins, so a value's name says where it came from,
-#     and nothing is typed `Any`: a field that holds a config names its class (schemas.py);
+#   * a config class is a @dataclass subclassing `Config`, holding LEAVES, NESTED CONFIG CLASSES and
+#     TABLES of one (`dict[K, C]`) — groups are composed as fields, not inherited as mixins, so a
+#     value's name says where it came from, and every type hint is one a YAML value can actually have,
+#     checked at the `class` statement (schemas.py);
 #   * a config FILE names the class it fills (`_schema: <dotted.path>`), and a hierarchical class takes
-#     a hierarchical file (structured.py);
+#     a hierarchical file; every key it sets is a field of that class (structured.py);
 #   * every leaf is required — nothing is silently defaulted, "off" is spelled `null` (structured.py);
 #   * where a run WRITES is not part of its config: `run_dir` and `log` are the launcher's, from the
 #     command line or the script (runs.py).
@@ -22,40 +23,24 @@
 # ${now:...} / ${from_yaml:...} resolvers; and paths.py for the project-root rule relative paths
 # resolve against.
 
-from .config import Block, Claim, Composed, compose, load_mapping_yaml, load_yaml
+from .config import compose, load_mapping_yaml, load_yaml
 from .partials import is_partial, partial_of, stated
 from .paths import project_root, resolve_path
-from .runs import (
-    run,
-    start_run,
-    tee_stdout,
-)
-from .schemas import (
-    check_schema,
-    field_schema,
-    fields_of,
-    resolve_schema,
-    schema_name,
-)
-from .structured import (
-    Spec,
-    load_config,
-    merge_specs,
-    peek,
-    schema_of,
-)
+from .runs import run, start_run, tee_stdout
+from .schemas import Config, Schema
+from .structured import Spec, load_config, merge_specs, peek, schema_of
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
+# What a config-driven script uses. Everything a schema is ASKED is a method of `Schema`, so one name
+# comes out of the schema layer instead of a handful of free functions doing one call each; the loader's
+# own record types (Claim, Composed, Key) stay in slimconfig.config, where a caller who wants them will
+# already be reading compose().
 __all__ = [
-    "Block",
-    "Claim",
-    "Composed",
+    "Config",
+    "Schema",
     "Spec",
-    "check_schema",
     "compose",
-    "field_schema",
-    "fields_of",
     "is_partial",
     "load_config",
     "load_mapping_yaml",
@@ -65,9 +50,7 @@ __all__ = [
     "peek",
     "project_root",
     "resolve_path",
-    "resolve_schema",
     "run",
-    "schema_name",
     "schema_of",
     "start_run",
     "stated",

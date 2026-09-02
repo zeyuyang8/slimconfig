@@ -51,13 +51,13 @@ def is_partial(cls: Any) -> bool:
 
 
 def _partial(cls: type, name: str, module: str, seen: tuple[type, ...]) -> type:
-    if cls in seen:  # check_schema rejects this too, but partial_of runs at class-definition time
+    if cls in seen:  # Schema.check rejects this too, but partial_of runs at class-definition time
         raise TypeError(f"config class {schema_name(cls)} contains itself; it has no partial")
     hints = get_type_hints(cls)
     specs: list[Any] = []
-    for field_name, (kind, group) in Schema(cls).fields.items():
-        if kind == "group" and group is not None:
-            sub = _partial(group, f"{group.__name__}Part", module, (*seen, cls))
+    for field_name, held in Schema(cls).fields.items():
+        if held.kind == "group" and held.cls is not None:
+            sub = _partial(held.cls, f"{held.cls.__name__}Part", module, (*seen, cls))
             specs.append((field_name, sub, dataclasses.field(default_factory=sub)))
         else:
             # A table's ENTRIES stay complete: a layer either names an entry or it does not, and an entry
@@ -71,8 +71,9 @@ def _partial(cls: type, name: str, module: str, seen: tuple[type, ...]) -> type:
 # Give every nested partial a name that says where it hangs, and hang it there — so `CellPart.GSSPart`
 # both reads right in an error message and resolves as a dotted path.
 def _attach(part: type, prefix: str) -> None:
-    for kind, group in Schema(part).fields.values():
-        if kind == "group" and group is not None and is_partial(group) and "." not in group.__qualname__:
+    for held in Schema(part).fields.values():
+        group = held.cls
+        if held.kind == "group" and is_partial(group) and "." not in group.__qualname__:
             group.__qualname__ = f"{prefix}.{group.__name__}"
             setattr(part, group.__name__, group)
             _attach(group, group.__qualname__)
@@ -83,8 +84,7 @@ def _attach(part: type, prefix: str) -> None:
 # table entries do not (an entry a layer names is a whole entry). Called twice with the same arguments it
 # returns the same class, so `issubclass` and OmegaConf's structured cache both behave.
 def partial_of(cls: type, *, name: str | None = None) -> type:
-    if not (isinstance(cls, type) and dataclasses.is_dataclass(cls)):
-        raise TypeError(f"{cls!r} is not a config class: partial_of takes a @dataclass")
+    Schema(cls)  # partial_of takes a config class, and says so the same way everything else does
     key = (cls, name or "")
     if key not in _cache:
         caller = sys._getframe(1).f_globals.get("__name__", cls.__module__)
@@ -101,11 +101,11 @@ def stated(layer: Any) -> dict[str, Any]:
     if not (dataclasses.is_dataclass(cls) and not isinstance(layer, type)):
         raise TypeError(f"stated() takes a config instance, got {layer!r}")
     out: dict[str, Any] = {}
-    for name, (kind, group) in Schema(cls).fields.items():
+    for name, held in Schema(cls).fields.items():
         value = getattr(layer, name)
         if isinstance(value, str) and value == MISSING:
             continue
-        if kind == "group" and group is not None and value is not None:
+        if held.kind == "group" and value is not None:
             inner = stated(value)
             if inner:
                 out[name] = inner

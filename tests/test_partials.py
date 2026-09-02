@@ -9,7 +9,8 @@ import fixtures
 import pytest
 from omegaconf import MISSING
 
-from slimconfig import is_partial, load_config, partial_of, schema_name, stated
+from slimconfig import Config, is_partial, load_config, partial_of, stated
+from slimconfig.schemas import schema_name
 
 # ── what partial_of builds ───────────────────────────────────────────────────
 
@@ -35,6 +36,8 @@ def test_a_nested_group_is_layered_too():
 
 def test_only_a_config_class_has_a_partial():
     with pytest.raises(TypeError, match="not a config class"):
+        partial_of(fixtures.PlainDataclass)
+    with pytest.raises(TypeError, match="is not a @dataclass"):
         partial_of(fixtures.NotADataclass)
 
 
@@ -113,7 +116,7 @@ def test_stated_takes_an_instance_not_a_class():
 
 def test_a_group_the_layer_was_silent_about_is_absent_not_empty():
     @dataclass
-    class Outer:
+    class Outer(Config):
         inner: fixtures.Data = field(default_factory=fixtures.Data)
         n: int = MISSING
 

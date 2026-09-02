@@ -37,7 +37,7 @@ from typing import Any, NoReturn, cast, get_type_hints
 from omegaconf import DictConfig, OmegaConf
 
 from .config import SCHEMA_KEY
-from .schemas import Field, Schema
+from .schemas import Config, Schema, Shape, declaration_name
 from .structured import Spec, load_config
 
 __all__ = ["run", "start_run", "tee_stdout"]
@@ -86,40 +86,42 @@ def _as_dictconfig(config: Any) -> DictConfig:
 
 
 # The `_schema:` lines that make a snapshot a config file like any other, so a run can be repeated from
-# its own folder (`python train.py <run_dir>/config.yaml --run-dir <somewhere>`). Every block that fills
-# a config class gets one, exactly as a hand-written config must — a snapshot missing them would not
-# reload, which is the strongest possible check that the rule is the same on both sides. Table entries
-# get none: their class comes from the table. `_schema` is written FIRST in each block, where a reader
-# looks for it.
+# its own folder (`python train.py <run_dir>/config.yaml --run-dir <somewhere>`). Every mapping that
+# fills a config class gets one, exactly as a hand-written config must — a snapshot missing them would
+# not reload, which is the strongest possible check that the rule is the same on both sides. A block
+# names its class; a table names `dict[<key>, <class>]`, once, for all of its entries; an entry names
+# nothing, since the table above it already said. `_schema` is written FIRST in each mapping, where a
+# reader looks for it.
 #
 # What the SCHEMA says a field holds only tells us where a block WOULD be; the value has to be one. A
 # partial (`partial_of`) leaves fields unset, and an unset group or table comes out of to_container as
 # the string "???" — there is no block there to name, so it is written through as it is.
-def _stamp(node: Mapping[str, Any], schema: Schema, tag: bool = True) -> dict[str, Any]:
-    out: dict[str, Any] = {SCHEMA_KEY: schema.name} if tag else {}
+def _stamp(node: Mapping[str, Any], schema: Schema, tag: str | None = None) -> dict[str, Any]:
+    out: dict[str, Any] = {} if tag is None else {SCHEMA_KEY: tag}
     fields = schema.fields
     for key, value in node.items():
-        kind, nested = fields.get(key, Field("value", None))
-        if nested is None or not isinstance(value, Mapping):
+        held = fields.get(key, Shape("value", None))
+        if held.cls is None or not isinstance(value, Mapping):
             out[key] = value
-        elif kind == "group":
-            out[key] = _stamp(value, Schema(nested))
-        else:  # a table: the entries are not tagged, but any group INSIDE one still is
-            out[key] = {
-                k: _stamp(v, Schema(nested), tag=False) if isinstance(v, Mapping) else v
+        elif held.kind == "group":
+            out[key] = _stamp(value, Schema(held.cls), declaration_name(held.cls))
+        else:  # a table: tagged once, here; its entries are not, but any group INSIDE one still is
+            out[key] = {SCHEMA_KEY: declaration_name(held.cls, held.key)} | {
+                k: _stamp(v, Schema(held.cls)) if isinstance(v, Mapping) else v
                 for k, v in value.items()
             }
     return out
 
 
-# The snapshot's YAML text. A config that is not a schema instance — a mapping a routine assembled —
-# names no class and is written as it is.
+# The snapshot's YAML text. A config that is not a config-class instance — a mapping or a plain
+# dataclass a routine assembled — names no class and is written as it is.
 def _snapshot(config: Any) -> str:
     node = _as_dictconfig(config)
-    if not (dataclasses.is_dataclass(config) and not isinstance(config, type)):
+    if not isinstance(config, Config):
         return OmegaConf.to_yaml(node, resolve=True)
     container = OmegaConf.to_container(node, resolve=True, enum_to_str=True)
-    return OmegaConf.to_yaml(OmegaConf.create(_stamp(cast(Mapping, container), Schema(type(config)))))
+    root = Schema(type(config))
+    return OmegaConf.to_yaml(OmegaConf.create(_stamp(cast(Mapping, container), root, root.name)))
 
 
 # Open the run's folder and record what produced it. Writes two files:
@@ -246,10 +248,10 @@ class _Entrypoint:
             )
         hints = get_type_hints(function)
         schema = hints.get(params[0].name)
-        if not (isinstance(schema, type) and dataclasses.is_dataclass(schema)):
+        if not (isinstance(schema, type) and dataclasses.is_dataclass(schema) and issubclass(schema, Config)):
             raise TypeError(
                 f"{name}'s argument `{params[0].name}` must be annotated with its config class "
-                f"(a dataclass), got {schema!r}"
+                f"(a @dataclass subclassing slimconfig.Config), got {schema!r}"
             )
         if len(params) == 2 and hints.get(params[1].name) is not str:
             raise TypeError(

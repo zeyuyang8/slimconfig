@@ -59,13 +59,15 @@ def test_start_run_snapshot_is_rerunnable_in_place(tmp_path, write):
 def test_a_snapshot_of_a_matrix_stamps_its_blocks_and_still_reloads(tmp_path, write):
     # The layers are PARTIAL, so most of `base` is unset — an unset group is not a block to stamp.
     body = "stage: main\nper_model: {}\nbase:\n  _schema: fixtures.TrainPart\n  model: a\nper_stage:\n"
+    body += "  _schema: dict[fixtures.Stage, fixtures.TrainPart]\n"
     body += "  main:\n    optim:\n      _schema: fixtures.TrainPart.OptimPart\n      lr: 0.1\n"
     cfg = load_config(fixtures.MatrixConfig, [write(tmp_path / "m.yaml", body, schema="fixtures.MatrixConfig")])
     run_dir = start_run(str(tmp_path / "run"), cfg)
     text = (tmp_path / "run" / "config.yaml").read_text()
     assert text.startswith("_schema: fixtures.MatrixConfig\n")
     assert "  _schema: fixtures.TrainPart\n" in text  # the `base` group, named
-    assert "_schema: fixtures.MatrixConfig\nper_stage:\n  main:\n" not in text  # a table entry, not named
+    assert "per_stage:\n  _schema: dict[fixtures.Stage, fixtures.TrainPart]\n  main:\n" in text  # the table, once
+    assert "  main:\n    _schema:" not in text  # its entry, not named
     assert load_config(fixtures.MatrixConfig, [f"{run_dir}/config.yaml"]) == cfg
 
 
@@ -338,14 +340,14 @@ def test_run_takes_the_schema_off_the_function_s_annotation(tmp_path, monkeypatc
 SOLO_SCRIPT = '''
 from dataclasses import dataclass, field
 from omegaconf import MISSING
-from slimconfig import run
+from slimconfig import Config, run
 
 @dataclass
-class Optim:
+class Optim(Config):
     lr: float = MISSING
 
 @dataclass
-class SoloConfig:
+class SoloConfig(Config):
     model: str = MISSING
     optim: Optim = field(default_factory=Optim)
 
@@ -390,6 +392,15 @@ def test_run_rejects_a_function_of_the_wrong_arity():
 
 def test_run_rejects_an_unannotated_function():
     def train(cfg) -> int:
+        return 0
+
+    with pytest.raises(TypeError, match="must be annotated with its config class"):
+        run(train)
+
+
+def test_run_rejects_a_plain_dataclass_as_the_config():
+    # A dataclass is not a config class until it says so: `run` takes the one the YAML can name.
+    def train(cfg: fixtures.PlainDataclass) -> int:
         return 0
 
     with pytest.raises(TypeError, match="must be annotated with its config class"):

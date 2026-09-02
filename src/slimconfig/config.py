@@ -1,16 +1,19 @@
 # slimconfig.config — the YAML layer: read a file, compose the `_default:` chain behind it, collect its
-# `_schema:` claims.
+# `_schema:` claims and the keys each file set.
 #
 # TWO KEYWORDS, AND THEY WORK AT ANY DEPTH.
 #
 #   _schema: <dotted.path.To.Class>   what this mapping fills. Required at the top of every config file
-#                                     AND at the top of every nested block that fills a config class of
-#                                     its own (that is the discipline: a mapping is written against a
-#                                     class, and says which). A table's entries are the one exception —
-#                                     their class was fixed by the table's declaration, not chosen by
-#                                     the entry. load_config checks every claim against the schema and
-#                                     is what enforces the requirement, since only it knows the schema;
-#                                     this module just records where each one was made.
+#   _schema: dict[<key>, <path>]      AND of every nested mapping in one that fills a config class (that
+#                                     is the discipline: a mapping is written against a class, and says
+#                                     which). The second spelling is a TABLE: the mapping is not one of
+#                                     that class, its entries each are — a distinction a reader cannot
+#                                     otherwise make, since the two are the same mapping on the page. A
+#                                     table names its entry class once, for all of them, and its entries
+#                                     name nothing. `<key>` is `str` or an Enum's dotted path: both
+#                                     halves are imported, so neither is a bare word from nowhere.
+#                                     load_config is what checks a claim and what requires one, since
+#                                     only it knows the schema; this module records where each was made.
 #   _default: <path>                  the ONE file this mapping starts from. It is composed first and
 #                                     the mapping's own keys are merged on top, so the file that writes
 #                                     `_default:` always wins over what it inherits.
@@ -52,7 +55,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple, cast
@@ -60,7 +63,7 @@ from typing import Any, NamedTuple, cast
 import yaml
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
-__all__ = ["Block", "Claim", "Composed", "compose", "load_mapping_yaml", "load_yaml"]
+__all__ = ["Claim", "Composed", "Key", "compose", "load_mapping_yaml", "load_yaml"]
 
 # The two reserved keys. Neither reaches the merged config: both are consumed here.
 SCHEMA_KEY = "_schema"
@@ -96,29 +99,35 @@ class Claim(NamedTuple):
     source: str            # the file it was read from, for the error message
 
 
-class Block(NamedTuple):
-    """One nested mapping a file wrote: where it sits, and which file wrote it.
+class Key(NamedTuple):
+    """One key a spec set: where it sits, who set it, and whether its value was a nested mapping.
 
-    Collected so load_config can hold every block that fills a config class to the same rule the top of
-    a file is held to — name the class. A block is recorded whatever it turns out to fill; only the
-    schema can say which ones are config classes, and the schema is not known here.
+    Every key of every file is recorded, and that is what lets a mistake be reported against the file
+    that MADE it. A composed config has no memory of where a value came from — `optim.lrr` merged from
+    three files deep in a `_default:` chain is just a key OmegaConf will refuse — so the answer has to
+    be kept while the walk still knows it.
+
+    `mapping` is the block question: a key whose value is a nested mapping is a block, and a block that
+    fills a config class must name the class (see load_config). Which of them do is a question only the
+    schema can answer, and the schema is not known here.
     """
 
     node: tuple[str, ...]  # the keys from the root of the config being loaded (never () — that is the file)
-    source: str            # the file that wrote it, for the error message
+    source: str            # the file (or override) that set it, for the error message
+    mapping: bool          # the value was a nested mapping
 
 
 class Composed(NamedTuple):
-    """A composed config, every `_schema:` claim made anywhere in it, and every nested block written.
+    """A composed config, every `_schema:` claim made anywhere in it, and every key set in it.
 
     This is what one config file composes to — and, merged, what a whole launch composes to: several
-    files and overlays are still one config, assembled from all of them, and its claims and blocks are
+    files and overlays are still one config, assembled from all of them, and its claims and keys are
     theirs put together (see `merge`).
     """
 
     config: DictConfig
     claims: tuple[Claim, ...]
-    blocks: tuple[Block, ...]
+    keys: tuple[Key, ...]
 
     # Nothing composed yet: the identity of `merge`.
     @classmethod
@@ -126,18 +135,35 @@ class Composed(NamedTuple):
         return cls(OmegaConf.create(), (), ())
 
     # A mapping that is not a config file — a `key=value` override, or values a caller computed. It
-    # makes no claims and writes no blocks: those are things a FILE is held to, and this is code.
+    # makes no claims: naming the class it fills is something a FILE is held to. An override still
+    # records its keys, under the text that was typed, since `optim.lrr=3` is a typo like any other; a
+    # mapping a caller built is code, and code is already typed.
+    #
+    # None of those keys is a BLOCK, though `optim.lr=1e-4` expands to a nested mapping: what was
+    # written is one key spelled with dots, and the mapping around it is an artifact of the expansion.
+    # A block is a mapping someone opened in a file, and only that is asked to name the class it fills.
     @classmethod
-    def of(cls, config: Mapping[str, Any] | DictConfig) -> Composed:
-        return cls(cast(DictConfig, OmegaConf.create(config)), (), ())
+    def of(cls, config: Mapping[str, Any] | DictConfig, source: str | None = None) -> Composed:
+        node = cast(DictConfig, OmegaConf.create(config))
+        return cls(node, (), tuple(_keys_in(node, (), source)) if source else ())
 
     # `other` on top of this one — later wins, key by key, exactly as OmegaConf merges.
     def merge(self, other: Composed) -> Composed:
         return Composed(
             cast(DictConfig, OmegaConf.merge(self.config, other.config)),
             self.claims + other.claims,
-            self.blocks + other.blocks,
+            self.keys + other.keys,
         )
+
+
+# Every key of a mapping, at every depth, as `source` set them — none of them a block (see `of`).
+def _keys_in(node: DictConfig, at: tuple[str, ...], source: str) -> Iterator[Key]:
+    raw = cast(dict, OmegaConf.to_container(node, resolve=False))
+    for key, value in raw.items():
+        child = (*at, str(key))
+        yield Key(child, source, False)
+        if isinstance(value, dict):
+            yield from _keys_in(cast(DictConfig, node[key]), child, source)
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
@@ -176,20 +202,21 @@ class _Composer:
 
     A composition is a recursive walk — down the `_default:` chain of a file, and down the nested blocks
     of each mapping in it — and everything it produces besides the config itself is accumulated across
-    the whole walk: the `_schema:` claims, the blocks written, and the chain of files currently open (so
-    a cycle can be named). Holding those on the walker keeps them out of every signature: `file` and
-    `mapping` take only what differs between calls — WHICH mapping, and WHERE it is being mounted.
+    the whole walk: the `_schema:` claims, the keys set and by which file, and the chain of files
+    currently open (so a cycle can be named). Holding those on the walker keeps them out of every
+    signature: `file` and `mapping` take only what differs between calls — WHICH mapping, and WHERE it
+    is being mounted.
     """
 
     def __init__(self) -> None:
         self.claims: list[Claim] = []
-        self.blocks: list[Block] = []
+        self.keys: list[Key] = []
         self.visiting: tuple[Path, ...] = ()  # the `_default:` chain currently open, outermost first
 
     @classmethod
     def compose(cls, path: Path, node: tuple[str, ...]) -> Composed:
         self = cls()
-        return Composed(self.file(path, node), tuple(self.claims), tuple(self.blocks))
+        return Composed(self.file(path, node), tuple(self.claims), tuple(self.keys))
 
     # One config FILE, composed at `node`. Every file must open by naming the class it fills: that is
     # the one thing a reader (and load_config) needs in order to know what the keys below it mean.
@@ -225,9 +252,9 @@ class _Composer:
         # that is fine.
         raw = cast(dict, OmegaConf.to_container(node_cfg, resolve=False))
         for key, value in raw.items():
+            child = (*node, str(key))
+            self.keys.append(Key(child, source, isinstance(value, dict)))
             if isinstance(value, dict):
-                child = (*node, str(key))
-                self.blocks.append(Block(child, source))
                 node_cfg[key] = self.mapping(cast(DictConfig, node_cfg[key]), child, source)
         return node_cfg if base is None else cast(DictConfig, OmegaConf.merge(base, node_cfg))
 

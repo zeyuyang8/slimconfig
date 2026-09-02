@@ -6,7 +6,8 @@ from __future__ import annotations
 import pytest
 from omegaconf import OmegaConf
 
-from slimconfig import Composed, compose, load_mapping_yaml, load_yaml
+from slimconfig import compose, load_mapping_yaml, load_yaml
+from slimconfig.config import Composed
 
 
 def test_load_yaml_returns_plain_dict(tmp_path, write):
@@ -266,7 +267,7 @@ def test_an_unresolvable_interpolation_does_not_break_composition(tmp_path, monk
 # ── Composed, the value a composition is ─────────────────────────────────────
 
 
-def test_composed_merges_configs_claims_and_blocks_together(tmp_path, monkeypatch, write):
+def test_composed_merges_configs_claims_and_keys_together(tmp_path, monkeypatch, write):
     # A launch that names several files is ONE config assembled from all of them, so merging two
     # compositions merges all three of the things a composition is — and later still wins.
     monkeypatch.chdir(tmp_path)
@@ -276,14 +277,28 @@ def test_composed_merges_configs_claims_and_blocks_together(tmp_path, monkeypatc
     assert both.config.model == "qwen"
     assert both.config.optim.lr == 1
     assert both.claims == a.claims + b.claims
-    assert both.blocks == a.blocks + b.blocks
+    assert both.keys == a.keys + b.keys
+
+
+def test_every_key_is_recorded_against_the_file_that_set_it(tmp_path, monkeypatch, write):
+    # What a merged config cannot say — which file set `optim.lr` — is kept while the walk still knows
+    # it, at every depth and through a `_default:` chain. A mapping is a block; a leaf is not.
+    monkeypatch.chdir(tmp_path)
+    base = write(tmp_path / "base.yaml", "model: llama\noptim:\n  _schema: fixtures.Optim\n  lr: 1\n")
+    child = write(tmp_path / "child.yaml", "_default: base.yaml\nmodel: qwen\n")
+    keys = compose(child).keys
+    assert (("model",), child, False) in keys
+    assert (("model",), base, False) in keys
+    assert (("optim",), base, True) in keys
+    assert (("optim", "lr"), base, False) in keys
 
 
 def test_composed_of_a_mapping_claims_nothing():
-    # Values a caller computed are code, and code is already typed: no `_schema:` to record, no block.
+    # Values a caller computed are code, and code is already typed: no `_schema:` to record, no key to
+    # hold against a file — there is no file.
     computed = Composed.of({"model": "llama"})
     assert computed.config.model == "llama"
-    assert computed.claims == () and computed.blocks == ()
+    assert computed.claims == () and computed.keys == ()
 
 
 def test_the_empty_composition_is_the_identity_of_merge(tmp_path, write):
