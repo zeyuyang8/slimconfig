@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import fixtures
 import pytest
+from omegaconf.errors import KeyValidationError
 
 from slimconfig import load_config, merge_specs, peek, schema_of
 
@@ -12,12 +13,10 @@ FULL = """
 model: llama
 tags: []
 resume_from: null
-optim:
-  _schema: fixtures.Optim
+optim > fixtures.Optim:
   lr: 0.0002
   warmup_steps: 100
-data:
-  _schema: fixtures.Data
+data > fixtures.Data:
   path: data/corpus.parquet
 """
 
@@ -119,13 +118,24 @@ def test_an_override_that_names_no_field_is_reported_as_itself(tmp_path, write):
 
 
 def test_a_key_inside_a_leaf_is_not_a_field_of_anything(tmp_path, write):
-    # `metrics` is a `dict[str, list[str]]`: the keys under it are the VALUE, not nodes of the schema.
+    # `metrics` is a `dict[Column, list[str]]`: the keys under it are the VALUE, not nodes of the schema.
     path = write(
         tmp_path / "a.yaml",
         "metrics:\n  psnr: [good]\nweights:\n  psnr: 1.0\nlabels: []\n",
         schema="fixtures.Report",
     )
     assert load_config(fixtures.Report, [path]).metrics == {"psnr": ["good"]}
+
+
+def test_a_key_inside_a_leaf_is_still_a_member_of_the_enum_that_keys_it(tmp_path, write):
+    # Not a node of the schema, but not a word from nowhere either: the leaf's own key type names it.
+    path = write(
+        tmp_path / "a.yaml",
+        "metrics:\n  bogus: [good]\nweights:\n  psnr: 1.0\nlabels: []\n",
+        schema="fixtures.Report",
+    )
+    with pytest.raises(KeyValidationError, match=r"'bogus' is incompatible with the enum type 'Column'"):
+        load_config(fixtures.Report, [path])
 
 
 # ── the file has to be the config it says it is ──────────────────────────────
@@ -175,27 +185,27 @@ def test_a_mapping_spec_needs_no_declaration(tmp_path, write):
 
 
 def test_a_block_that_fills_a_class_must_name_it(tmp_path, write):
-    body = FULL.replace("  _schema: fixtures.Optim\n", "")
+    body = FULL.replace("optim > fixtures.Optim:", "optim:")
     path = write(tmp_path / "a.yaml", body)
-    match = r"block `optim`.*fixtures\.Optim.*add `_schema: fixtures\.Optim`"
+    match = r"block `optim`.*fixtures\.Optim.*`optim > fixtures\.Optim:`"
     with pytest.raises(ValueError, match=match):
         load_config(fixtures.TrainConfig, [path])
 
 
-TABLE = "stage: main\nper_stage: {{}}\nper_model:\n{line}  llama:\n    path: a.parquet\n"
+TABLE = "stage: main\nper_stage: {{}}\nper_model{line}:\n  llama:\n    path: a.parquet\n"
 
 
 def test_a_table_names_its_entry_class_once_for_all_of_them(tmp_path, write):
     # One line at the table, not one per entry: which class an entry has was fixed by the table.
-    body = TABLE.format(line="  _schema: dict[str, fixtures.Data]\n")
+    body = TABLE.format(line=" > dict[fixtures.Name, fixtures.Data]")
     cfg = load_config(fixtures.MatrixConfig, [write(tmp_path / "m.yaml", body, schema="fixtures.MatrixConfig")])
     assert cfg.per_model["llama"].path == "a.parquet"
 
 
 def test_a_table_entry_does_not_name_its_class(tmp_path, write):
     # The entry is bare — and the table above it is what says what an entry is.
-    body = TABLE.format(line="  _schema: dict[str, fixtures.Data]\n").replace(
-        "    path:", "    _schema: fixtures.Data\n    path:"
+    body = TABLE.format(line=" > dict[fixtures.Name, fixtures.Data]").replace(
+        "  llama:", "  llama > fixtures.Data:"
     )
     path = write(tmp_path / "m.yaml", body, schema="fixtures.MatrixConfig")
     assert load_config(fixtures.MatrixConfig, [path]).per_model["llama"].path == "a.parquet"
@@ -203,27 +213,27 @@ def test_a_table_entry_does_not_name_its_class(tmp_path, write):
 
 def test_a_table_that_does_not_say_what_it_holds_is_rejected(tmp_path, write):
     path = write(tmp_path / "m.yaml", TABLE.format(line=""), schema="fixtures.MatrixConfig")
-    with pytest.raises(ValueError, match=r"table `per_model`.*`_schema: dict\[str, fixtures.Data\]`"):
+    with pytest.raises(ValueError, match=r"table `per_model`.*`per_model > dict\[fixtures.Name, fixtures.Data\]:`"):
         load_config(fixtures.MatrixConfig, [path])
 
 
 def test_a_table_and_a_group_are_told_apart_by_the_declaration(tmp_path, write):
     # The same mapping shape on the page. `dict[K, C]` is what says which of the two it is, so naming a
     # table as one class, or a group as a table of one, is an error and not a shrug.
-    flat = write(tmp_path / "flat.yaml", TABLE.format(line="  _schema: fixtures.Data\n"),
+    flat = write(tmp_path / "flat.yaml", TABLE.format(line=" > fixtures.Data"),
                  schema="fixtures.MatrixConfig")
     with pytest.raises(ValueError, match=r"per_model is a table of fixtures.Data, not one of it"):
         load_config(fixtures.MatrixConfig, [flat])
-    keyed = FULL.replace("  _schema: fixtures.Optim\n", "  _schema: dict[str, fixtures.Optim]\n")
+    keyed = FULL.replace("optim > fixtures.Optim:", "optim > dict[fixtures.Name, fixtures.Optim]:")
     with pytest.raises(ValueError, match=r"`optim`.*is ONE fixtures.Optim, not several"):
         load_config(fixtures.TrainConfig, [write(tmp_path / "t.yaml", keyed)])
 
 
 def test_a_table_says_what_its_keys_are_and_they_are_checked(tmp_path, write):
-    body = "stage: main\nper_model: {}\nper_stage:\n  _schema: dict[str, fixtures.TrainPart]\n  main: {}\n"
+    body = "stage: main\nper_model: {}\nper_stage > dict[fixtures.Name, fixtures.TrainPart]:\n  main: {}\n"
     path = write(tmp_path / "m.yaml", body, schema="fixtures.MatrixConfig")
-    with pytest.raises(ValueError, match=r"keyed by str, but fixtures.MatrixConfig.per_stage is keyed by "
-                                         r"fixtures.Stage: `_schema: dict\[fixtures.Stage, "):
+    with pytest.raises(ValueError, match=r"keyed by fixtures.Name, but fixtures.MatrixConfig.per_stage is keyed by "
+                                         r"fixtures.Stage: `per_stage > dict\[fixtures.Stage, "):
         load_config(fixtures.MatrixConfig, [path])
 
 
@@ -231,7 +241,7 @@ def test_a_whole_table_can_be_mounted_from_a_fragment(tmp_path, monkeypatch, wri
     # Saying the shape is also what lets a shared file fill a table: it declares `dict[K, C]` at its own
     # top level, and the parent says which table it lands on.
     monkeypatch.chdir(tmp_path)
-    write(tmp_path / "models.yaml", "llama:\n  path: a.parquet\n", schema="dict[str, fixtures.Data]")
+    write(tmp_path / "models.yaml", "llama:\n  path: a.parquet\n", schema="dict[fixtures.Name, fixtures.Data]")
     body = "stage: main\nper_stage: {}\nper_model:\n  _default: models.yaml\n"
     cfg = load_config(fixtures.MatrixConfig, [write(tmp_path / "m.yaml", body, schema="fixtures.MatrixConfig")])
     assert cfg.per_model["llama"].path == "a.parquet"
@@ -239,10 +249,18 @@ def test_a_whole_table_can_be_mounted_from_a_fragment(tmp_path, monkeypatch, wri
 
 def test_an_empty_table_has_nothing_to_declare(tmp_path, write):
     # `per_model: {}` is how a config says it has none, and there is no entry under it to read.
-    body = "stage: main\nper_stage: {}\nper_model: {}\nbase:\n  _schema: fixtures.TrainPart\n  model: a\n"
+    body = "stage: main\nper_stage: {}\nper_model: {}\nbase > fixtures.TrainPart:\n  model: a\n"
     path = write(tmp_path / "m.yaml", body, schema="fixtures.MatrixConfig")
     cfg = load_config(fixtures.MatrixConfig, [path])
     assert cfg.base.model == "a" and cfg.per_model == {}
+
+
+def test_a_declared_block_with_nothing_under_it_is_the_empty_mapping(tmp_path, write):
+    # `null` is how a config turns a block off, and a key naming a class is not turning one off — a
+    # class with no field to state is still a block.
+    body = "stage: main\nper_stage: {}\nper_model: {}\nbase > fixtures.TrainPart:\n"
+    cfg = load_config(fixtures.MatrixConfig, [write(tmp_path / "m.yaml", body, schema="fixtures.MatrixConfig")])
+    assert isinstance(cfg.base, fixtures.TrainPart)
 
 
 def test_a_layer_block_names_its_partial(tmp_path, write):
@@ -253,7 +271,7 @@ def test_a_layer_block_names_its_partial(tmp_path, write):
 
 
 def test_a_group_inside_a_table_entry_still_names_itself(tmp_path, write):
-    body = ("stage: main\nper_model: {}\nper_stage:\n  _schema: dict[fixtures.Stage, fixtures.TrainPart]\n"
+    body = ("stage: main\nper_model: {}\nper_stage > dict[fixtures.Stage, fixtures.TrainPart]:\n"
             "  main:\n    optim:\n      lr: 0.1\n")
     path = write(tmp_path / "m.yaml", body, schema="fixtures.MatrixConfig")
     with pytest.raises(ValueError, match=r"block `per_stage.main.optim`"):
@@ -263,12 +281,12 @@ def test_a_group_inside_a_table_entry_still_names_itself(tmp_path, write):
 def test_a_table_key_may_contain_a_dot(tmp_path, write):
     # `flux.1-dev` is ONE key, so the node of the block under it is ("per_model", "flux.1-dev", "optim")
     # — three keys. Written as one dotted string it would re-split into four and place nothing.
-    body = ("per_model:\n  _schema: dict[str, fixtures.TrainPart]\n"
-            "  flux.1-dev:\n    optim:\n{line}      lr: 0.1\n")
+    body = ("per_model > dict[fixtures.Backbone, fixtures.TrainPart]:\n"
+            "  flux.1-dev:\n    optim{line}:\n      lr: 0.1\n")
     bare = write(tmp_path / "bare.yaml", body.format(line=""), schema="fixtures.ModelMatrix")
     with pytest.raises(ValueError, match=r"block `per_model.flux.1-dev.optim`.*TrainPart.OptimPart"):
         load_config(fixtures.ModelMatrix, [bare])
-    named = body.format(line="      _schema: fixtures.TrainPart.OptimPart\n")
+    named = body.format(line=" > fixtures.TrainPart.OptimPart")
     path = write(tmp_path / "m.yaml", named, schema="fixtures.ModelMatrix")
     assert load_config(fixtures.ModelMatrix, [path]).per_model["flux.1-dev"].optim.lr == 0.1
 
@@ -278,7 +296,7 @@ def test_a_block_that_only_mounts_a_fragment_is_named_by_the_fragment(tmp_path, 
     monkeypatch.chdir(tmp_path)
     write(tmp_path / "opt.yaml", "lr: 1.0\nwarmup_steps: 5\n", schema="fixtures.Optim")
     body = FULL.replace(
-        "  _schema: fixtures.Optim\n  lr: 0.0002\n  warmup_steps: 100\n", "  _default: opt.yaml\n"
+        "optim > fixtures.Optim:\n  lr: 0.0002\n  warmup_steps: 100\n", "optim:\n  _default: opt.yaml\n"
     )
     cfg = load_config(fixtures.TrainConfig, [write(tmp_path / "train.yaml", body)])
     assert (cfg.optim.lr, cfg.optim.warmup_steps) == (1.0, 5)

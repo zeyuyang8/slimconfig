@@ -18,12 +18,10 @@ FULL = """
 model: llama
 tags: []
 resume_from: null
-optim:
-  _schema: fixtures.Optim
+optim > fixtures.Optim:
   lr: 0.0002
   warmup_steps: 100
-data:
-  _schema: fixtures.Data
+data > fixtures.Data:
   path: data/corpus.parquet
 """
 
@@ -44,7 +42,7 @@ def test_start_run_writes_a_resolved_snapshot_and_meta(tmp_path, write):
 def test_the_snapshot_names_the_class_so_it_is_a_config_like_any_other(tmp_path, write):
     cfg = load_config(fixtures.TrainConfig, [write(tmp_path / "a.yaml", FULL)])
     start_run(str(tmp_path / "run"), cfg)
-    assert (tmp_path / "run" / "config.yaml").read_text().startswith("_schema: fixtures.TrainConfig\n")
+    assert (tmp_path / "run" / "config.yaml").read_text().startswith("_ > fixtures.TrainConfig:\n")
 
 
 def test_start_run_snapshot_is_rerunnable_in_place(tmp_path, write):
@@ -58,22 +56,22 @@ def test_start_run_snapshot_is_rerunnable_in_place(tmp_path, write):
 
 def test_a_snapshot_of_a_matrix_stamps_its_blocks_and_still_reloads(tmp_path, write):
     # The layers are PARTIAL, so most of `base` is unset — an unset group is not a block to stamp.
-    body = "stage: main\nper_model: {}\nbase:\n  _schema: fixtures.TrainPart\n  model: a\nper_stage:\n"
-    body += "  _schema: dict[fixtures.Stage, fixtures.TrainPart]\n"
-    body += "  main:\n    optim:\n      _schema: fixtures.TrainPart.OptimPart\n      lr: 0.1\n"
+    body = "stage: main\nper_model: {}\nbase > fixtures.TrainPart:\n  model: a\nper_stage:\n"
+    body = body.replace("per_stage:\n", "per_stage > dict[fixtures.Stage, fixtures.TrainPart]:\n")
+    body += "  main:\n    optim > fixtures.TrainPart.OptimPart:\n      lr: 0.1\n"
     cfg = load_config(fixtures.MatrixConfig, [write(tmp_path / "m.yaml", body, schema="fixtures.MatrixConfig")])
     run_dir = start_run(str(tmp_path / "run"), cfg)
     text = (tmp_path / "run" / "config.yaml").read_text()
-    assert text.startswith("_schema: fixtures.MatrixConfig\n")
-    assert "  _schema: fixtures.TrainPart\n" in text  # the `base` group, named
-    assert "per_stage:\n  _schema: dict[fixtures.Stage, fixtures.TrainPart]\n  main:\n" in text  # the table, once
-    assert "  main:\n    _schema:" not in text  # its entry, not named
+    assert text.startswith("_ > fixtures.MatrixConfig:\n")
+    assert "base > fixtures.TrainPart:\n" in text  # the `base` group, named
+    assert "per_stage > dict[fixtures.Stage, fixtures.TrainPart]:\n  main:\n" in text  # the table, once
+    assert "  main >" not in text  # its entry, not named
     assert load_config(fixtures.MatrixConfig, [f"{run_dir}/config.yaml"]) == cfg
 
 
 def test_a_snapshot_leaves_an_unset_table_alone(tmp_path, write):
     # A layer's unset table is not a table in the snapshot, it is `???` — there is no block to stamp.
-    body = "per_stage: {}\nbase:\n  _schema: fixtures.SearchPart\n  trials: 4\n"
+    body = "per_stage: {}\nbase > fixtures.SearchPart:\n  trials: 4\n"
     path = write(tmp_path / "s.yaml", body, schema="fixtures.SearchMatrix")
     cfg = load_config(fixtures.SearchMatrix, [path])
     run_dir = start_run(str(tmp_path / "run"), cfg)
@@ -83,7 +81,7 @@ def test_a_snapshot_leaves_an_unset_table_alone(tmp_path, write):
 def test_start_run_accepts_a_dataclass_instance(tmp_path, write):
     cfg = load_config(fixtures.TrainConfig, [write(tmp_path / "a.yaml", FULL)])
     run_dir = start_run(str(tmp_path / "run"), cfg)
-    assert OmegaConf.load(f"{run_dir}/config.yaml").optim.warmup_steps == 100
+    assert load_config(fixtures.TrainConfig, [f"{run_dir}/config.yaml"]).optim.warmup_steps == 100
 
 
 def test_start_run_survives_an_unsnapshottable_config(tmp_path, capsys):
@@ -180,11 +178,24 @@ def test_run_takes_a_config_path_and_overrides_from_the_caller(tmp_path, monkeyp
     assert (tmp_path / "run" / "config.yaml").is_file()
 
 
-def test_run_reports_usage_when_given_no_config(monkeypatch):
+def test_run_with_no_config_runs_on_the_schemas_own_defaults(tmp_path, monkeypatch):
+    def train(cfg: fixtures.Settled, run_dir: str) -> int:
+        return 0 if (cfg.model, cfg.steps) == ("llama", 20) else 1
+
+    # Nothing named, so the class is the config — and `key=value` still wins over it. The snapshot is
+    # written all the same: a run of the defaults is still answerable to a file that lists them.
+    code = launch(monkeypatch, ["steps=20"], train, run_dir=str(tmp_path / "run"))
+    assert code == 0
+    assert OmegaConf.load(tmp_path / "run" / "config.yaml").model == "llama"
+
+
+def test_run_reports_usage_when_given_no_config_and_the_schema_is_not_complete(monkeypatch):
     def train(cfg: fixtures.TrainConfig) -> int:
         raise AssertionError("must not run")
 
-    assert "usage: train.py <config.yaml>" in str(launch(monkeypatch, [], train))
+    message = str(launch(monkeypatch, [], train))
+    assert "missing required field(s): model" in message  # what the run is short of, named
+    assert "usage: train.py <config.yaml>" in message  # and where such a field is filled in
 
 
 # ── run: where it writes is the launcher's, not the config's ─────────────────
@@ -365,7 +376,7 @@ def test_a_one_file_script_can_name_its_own_classes(tmp_path):
     # something. Launched for real, because that is the only way `__main__` is what it will be.
     (tmp_path / "solo.py").write_text(SOLO_SCRIPT, encoding="utf-8")
     (tmp_path / "solo.yaml").write_text(
-        "_schema: solo.SoloConfig\nmodel: llama\noptim:\n  _schema: solo.Optim\n  lr: 0.5\n",
+        "_ > solo.SoloConfig:\nmodel: llama\noptim > solo.Optim:\n  lr: 0.5\n",
         encoding="utf-8",
     )
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
@@ -374,7 +385,7 @@ def test_a_one_file_script_can_name_its_own_classes(tmp_path):
     assert done.returncode == 0, done.stderr
     assert "llama 0.5" in done.stdout
     # ...and the snapshot names it the same way, so the run is repeatable from its own folder.
-    assert (tmp_path / "run" / "config.yaml").read_text().startswith("_schema: solo.SoloConfig\n")
+    assert (tmp_path / "run" / "config.yaml").read_text().startswith("_ > solo.SoloConfig:\n")
 
 
 def test_run_rejects_a_function_that_is_not_one_of():

@@ -6,12 +6,15 @@
 #
 # Four rules, enforced at load time:
 #   * every config FILE — and every nested BLOCK or TABLE in one that fills a config class — names that
-#     class (`_schema: <dotted.path>`, or `_schema: dict[<key>, <dotted.path>]` for a table, which names
-#     its entry class once for all its entries), and it must be the class it is being merged onto, or a
+#     class on its own key (`<key> > <dotted.path>:`, `_ > <dotted.path>:` for the file itself, or
+#     `<key> > dict[<key type>, <dotted.path>]:` for a table, naming its entry class once for all of
+#     them), and it must be the class it is being merged onto, or a
 #     base of it. So a fragment cannot be mounted at a block it was not written for, pointing a script at
 #     the wrong config fails by class name instead of by an unknown key three levels down, and a
 #     hierarchical config says at every level what it is filling instead of only at the top;
-#   * every key a file sets is a field of the class that file is filling — checked file by file, so a
+#   * every key a file sets is REGISTERED — a field of the class that file is filling, or, under a
+#     table or a mapping leaf, a member of the Enum that mapping is keyed by (a key type that is not an
+#     Enum is rejected at the `class` statement, so there is no third case). Checked file by file, so a
 #     typo is reported against the file that wrote it and not against the merged config, which has no
 #     memory of which of a `_default:` chain a key came from;
 #   * every leaf must end up set — an unset MISSING leaf raises (a nullable field that is "off" must
@@ -25,15 +28,16 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
+from enum import Enum
 from functools import reduce
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, cast, get_args, get_origin
 
 from omegaconf import DictConfig, OmegaConf
 
 from .config import Claim, Composed, Key, compose
 from .partials import is_partial
-from .schemas import Schema, declaration_name, key_name, value_error
+from .schemas import Schema, declaration_name, key_name, optional, value_error
 
 # One config source: a YAML file path, a `dotted.key=value` override, or a ready-made mapping.
 type Spec = str | Mapping[str, Any] | DictConfig
@@ -126,12 +130,12 @@ def _merge(specs: list[Spec]) -> Composed:
 # Merge YAML files, dotted key=value overrides, and already-built mappings into one unstructured
 # config. A mapping spec lets a caller merge values it computed itself (one cell of a sweep matrix
 # resolved at runtime, say) under the same precedence rule — later specs win. A mapping is not a file
-# and carries no `_schema:`; it is code, and code is already typed.
+# and declares no class; it is code, and code is already typed.
 def merge_specs(specs: list[Spec]) -> DictConfig:
     return _merge(specs).config
 
 
-# Check every `_schema:` line against the class the config is actually being loaded as. A claim names
+# Check every declaration against the class the config is actually being loaded as. A claim names
 # the class its block was written for; the block's real class comes from walking the schema. They agree
 # when the claim is that class or a base of it — a base states a subset of the fields, which is exactly
 # what a shared fragment does.
@@ -163,13 +167,13 @@ def _table_at(schema: Schema, claim: Claim, where: str, key: type) -> Schema:
         one = Schema(cast(type, at.cls)).name
         raise ValueError(
             f"config file {claim.source!r} says {where} is a table ({claim.schema}), but {where} of "
-            f"{schema.name} is ONE {one}, not several keyed by anything: `_schema: {one}`"
+            f"{schema.name} is ONE {one}, not several keyed by anything: `{'.'.join(claim.node)} > {one}`"
         )
     if key is not at.key:  # the same NAME from another module is another type, and would key nothing
         raise ValueError(
             f"config file {claim.source!r} says {where} is keyed by {key_name(key)}, but {schema.name}."
             f"{'.'.join(claim.node)} is keyed by {key_name(at.key)}: "
-            f"`_schema: {declaration_name(at.cls, at.key)}`"
+            f"`{'.'.join(claim.node)} > {declaration_name(at.cls, at.key)}`"
         )
     return Schema(at.cls)
 
@@ -201,8 +205,9 @@ def _check_declared(schema: Schema, keys: tuple[Key, ...], claims: tuple[Claim, 
         what = "block" if at.kind == "group" else "table"
         raise ValueError(
             f"config file {block.source!r} writes the {what} `{'.'.join(block.node)}`, which fills the "
-            f"config class {Schema(at.cls).name}, without saying so: add `_schema: {spelled}` at the top "
-            f"of that {what}. Every mapping that fills a config class names the class it fills."
+            f"config class {Schema(at.cls).name}, without saying so: write its key as "
+            f"`{block.node[-1]} > {spelled}:`. Every mapping that fills a config class names the class "
+            f"it fills."
         )
 
 
@@ -212,8 +217,10 @@ def _check_declared(schema: Schema, keys: tuple[Key, ...], claims: tuple[Claim, 
 # still attached to the file (or the `key=value` override) that wrote it.
 #
 # Keys BELOW a leaf are not nodes of the schema at all: `metrics: {psnr: [...]}` on a
-# `dict[str, list[str]]` field writes a mapping the schema has nothing to say about beyond the leaf
+# `dict[Metric, list[str]]` field writes a mapping the schema has nothing to say about beyond the leaf
 # itself, so the walk is only asked about a key whose whole path so far landed on groups and entries.
+# Those keys are not unchecked, though — the leaf's own key type is an Enum, and `_wrong_values` holds
+# the mapping to it.
 def _check_keys(schema: Schema, keys: tuple[Key, ...]) -> None:
     for key in keys:
         walked = list(schema.walk(key.node))
@@ -229,6 +236,58 @@ def _check_keys(schema: Schema, keys: tuple[Key, ...]) -> None:
         )
 
 
+# A word an Enum names, as the MEMBER it names — the value first, since that is how a config file spells
+# an Enum. OmegaConf resolves a string to a member by NAME only, and a member's name is a python
+# identifier, so `flux.1-dev` places nowhere; inside a nested mapping (`dict[K, dict[K2, V]]`) no string
+# places at all. Resolving the member here is what makes ONE spelling work everywhere in a config — as a
+# key, as a scalar, in a list. A word no member names is left alone, for OmegaConf to reject with the
+# members it could have been.
+def _member(word: Any, enum: type) -> Any:
+    members = {name: member for member in cast(Any, enum) for name in (member.value, member.name)}
+    return members.get(word, word) if isinstance(word, str) else word
+
+
+def _by_member(mapping: Any, key: type) -> Any:
+    if not isinstance(mapping, Mapping):
+        return mapping
+    return {_member(k, key): v for k, v in mapping.items()}
+
+
+# The same, everywhere in one LEAF its annotation says an Enum can be: the keys of a mapping, the values
+# of one, the elements of a list, the leaf itself.
+def _leaf_enums(value: Any, annotation: Any) -> Any:
+    ann = optional(annotation)
+    origin = get_origin(ann)
+    if isinstance(ann, type) and issubclass(ann, Enum):
+        return _member(value, ann)
+    if origin is list and isinstance(value, list):
+        return [_leaf_enums(v, get_args(ann)[0]) for v in value]
+    if origin is not dict or not isinstance(value, Mapping):
+        return value
+    key, held = get_args(ann)
+    return {k: _leaf_enums(v, held) for k, v in _by_member(value, key).items()}
+
+
+# Every word in `node` that an Enum names, as that member — the whole config, walked against the schema,
+# before it is merged onto it.
+def _enum_words(node: Any, schema: Schema) -> Any:
+    if not isinstance(node, Mapping):
+        return node
+    out = dict(node)
+    for name, held in schema.fields.items():
+        if name not in out or out[name] is None:
+            continue
+        if held.kind == "group":
+            out[name] = _enum_words(out[name], Schema(cast(type, held.cls)))
+        elif held.kind == "table":
+            entries = _by_member(out[name], cast(type, held.key))
+            if isinstance(entries, Mapping):
+                out[name] = {k: _enum_words(v, Schema(cast(type, held.cls))) for k, v in entries.items()}
+        else:
+            out[name] = _leaf_enums(out[name], schema.hints[name])
+    return out
+
+
 # Merge `specs` (YAML files and/or dotted key=value overrides) onto `schema`, in order (list a file
 # before the overrides that should win over it). Returns a fully-populated schema instance. Raises
 # TypeError if the schema itself cannot be filled from YAML, ValueError if a spec names the wrong class
@@ -241,7 +300,8 @@ def load_config[T](schema: type[T], specs: list[Spec]) -> T:
     _check_claims(root, composed.claims)
     _check_declared(root, composed.keys, composed.claims)
     _check_keys(root, composed.keys)
-    merged = cast(DictConfig, OmegaConf.merge(OmegaConf.structured(schema), composed.config))
+    named = OmegaConf.create(_enum_words(OmegaConf.to_container(composed.config, resolve=False), root))
+    merged = cast(DictConfig, OmegaConf.merge(OmegaConf.structured(schema), named))
     missing = _missing_fields(merged, root)
     if missing:
         raise ValueError(f"{root.cls.__name__} is missing required field(s): {', '.join(missing)}")
@@ -258,12 +318,12 @@ def peek(args: list[Spec], key: str) -> Any:
     return OmegaConf.select(merge_specs(args), key, default=None)
 
 
-# The class a config file was written against, without loading it: the top-level `_schema:` line,
+# The class a config file was written against, without loading it: the file's own `_ > <class>:` line,
 # imported. For an entry point that dispatches on the config it was handed. A file that fills a table
 # answers with its ENTRY class — the only class it names.
 def schema_of(path: str) -> type:
     claims = compose(path).claims
     root = next((c for c in claims if not c.node), None)
-    if root is None:  # compose() rejects a file with no top-level `_schema:`, so this cannot happen
-        raise ValueError(f"config file {path!r} declares no top-level `_schema:`")
+    if root is None:  # compose() rejects a file that declares no class of its own, so this cannot happen
+        raise ValueError(f"config file {path!r} declares no class of its own")
     return Schema.declared(root.schema).schema.cls

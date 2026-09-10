@@ -9,11 +9,14 @@ Four rules:
   tables of one.** Groups are *composed* as fields, not inherited as mixins, so every value's name says
   which group it came from — and every type hint is one a YAML value can actually have, checked at the
   `class` statement: no `Any`, no bare `list`, no field that holds a config without naming its class.
-* **Every mapping that fills a config class names it** — `_schema: myproject.train.TrainConfig` — at
-  the top of a file and at the top of each nested block, so a hierarchical class takes a hierarchical
-  file that says what it is filling at every level. A table says it once for all its entries, and says
-  it is a table: `_schema: dict[str, myproject.train.Data]`. Every key it sets is a field of that class,
-  checked file by file. Rename the class and its configs break loudly.
+* **Every mapping that fills a config class names it, on its own key** —
+  `optim > myproject.train.Optim:` — so a hierarchical class takes a hierarchical file that says what it
+  is filling at every level. A file names its own class on the reserved key `_`
+  (`_ > myproject.train.TrainConfig:`, carrying no value), since it has no key of its own. A table says
+  it once for all its entries, and says it is a table:
+  `data > dict[myproject.tasks.Task, myproject.train.Data]:`. Every key it sets is registered — a field
+  of that class, or, under a mapping, a member of the `Enum` that mapping is keyed by — checked file by
+  file. Rename the class and its configs break loudly.
 * **Every leaf is required, and holds what it said it holds.** A schema's leaves all default to
   `MISSING`, so a config has to set each one explicitly — "off" is still written out as `null`, an empty
   collection as `[]`. Nothing is silently inherited, and the value is checked all the way down.
@@ -55,10 +58,9 @@ print(cfg.optim.lr)
 
 ```yaml
 # configs/train.yaml
-_schema: train.TrainConfig     # the class this file fills, by dotted import path
+_ > train.TrainConfig:         # the class this file fills, by dotted import path
 model: llama-3-8b
-optim:                         # a nested class takes a nested block...
-  _schema: train.Optim         # ...which names its own class, the same way the file does
+optim > train.Optim:           # a nested class takes a nested block, named the same way
   lr: 2.0e-4
   warmup_steps: 100
 resume_from: null
@@ -72,11 +74,15 @@ python train.py configs/train.yaml optim.lr=1e-4   # ...plus dotted overrides, l
 Leave `warmup_steps` out and the load fails with
 `TrainConfig is missing required field(s): optim.warmup_steps` — before anything runs.
 
-Leave the block's `_schema:` out and the load fails the same way, naming the line to add: a block that
+Write `optim:` bare and the load fails the same way, naming the key to write instead: a block that
 fills a class is written against that class exactly as a file is. A table is too, and says so as a
-table — `_schema: dict[str, train.Data]` — since a group and a table are the same mapping on the page
+table — `data > dict[tasks.Task, train.Data]:` — since a group and a table are the same mapping on the page
 and the spelling is what tells them apart. Its ENTRIES name nothing: which class an entry has was fixed
 by the table above it.
+
+A declared key with nothing under it is the EMPTY mapping of that class — a class with no field to
+state is still a block, and `null` is how a config turns a block off, which is said on a bare key
+(`optim: null`), not on one naming a class.
 
 Set `warmup_steps: fast` and the load fails with
 `Value 'fast' could not be converted to Integer`; set `optim.lrr=1e-4` and it fails with
@@ -102,19 +108,21 @@ are kept:
 | `str` `int` `float` `bool` | a scalar |
 | an `Enum` | a scalar whose values are named — an `Enum` is how a config states a choice |
 | `str \| int \| float` | a union of *scalars* — OmegaConf holds one and checks it |
-| `list[T]`, `dict[K, V]` of the above, nested as deep as you like | a collection, fully parameterized |
+| `list[T]`, `dict[SomeEnum, V]` of the above, nested as deep as you like | a collection, fully parameterized |
 | any of that `\| None` | a leaf that can be switched off |
 | `C = field(default_factory=C)` for a config class `C` | a nested group — the factory is required |
-| `dict[str, C]`, `dict[SomeEnum, C]` | a table of `C` |
+| `dict[SomeEnum, C]` | a table of `C` |
 
 Everything else is rejected by name, at the class, with what to write instead — `Any` and `object`
 (they say nothing), a bare `list` or `dict` (they do not say what they hold), `list[str] | int`
 (OmegaConf does not hold a union of containers), `tuple` / `set` / `Literal` (OmegaConf cannot hold or
 check them), `Path` (it does not survive the run snapshot — declare it `str` and call `resolve_path`),
-and `list[C]` for a config class `C` (key them instead, as a table).
+`list[C]` for a config class `C` (key them instead, as a table), and a `dict` keyed by anything but an
+`Enum` — every key a config file writes is registered somewhere, and a `dict[str, ...]` takes any word
+at all, which is a key a reader cannot look up and a typo nothing can catch.
 
 The other half of a hint being accurate is that the value is held to it. OmegaConf checks a scalar but
-lets a `list[str]` hold a mapping and a `dict[str, float]` hold a list, so slimconfig walks the loaded
+lets a `list[str]` hold a mapping and a `dict[K, float]` hold a list, so slimconfig walks the loaded
 leaves itself and reports the whole path to the value that is wrong: `weights['psnr'] is not a float`.
 
 A schema that contains itself is rejected too — it has no finite YAML — which is the one rule that
@@ -139,30 +147,31 @@ class TrainConfig(Config):             # ✓ optim.lr and data.path, in the clas
 
 ### Tables: several of the same group, keyed
 
-A field typed `dict[str, C]` — or `dict[SomeEnum, C]` — for a config class `C` holds **several** of
-that group, one per key: per model, per task, per environment. Entries are validated exactly like a
-group (unknown key rejected, values type-checked), and an `Enum` key type checks the *keys* too.
+A field typed `dict[SomeEnum, C]` for a config class `C` holds **several** of that group, one per key:
+per model, per task, per environment. Entries are validated exactly like a group (unknown key rejected,
+values type-checked), and the key type checks the *keys* too — a key no member names is rejected, with
+the members that would have done.
 
 ```python
 @dataclass
 class Sweep(Config):
-    axes: dict[str, Axis] = MISSING          # a table of Axis
-    weights: dict[str, float] = MISSING      # a dict of plain values: just a leaf
+    axes: dict[Knob, Axis] = MISSING         # a table of Axis
+    weights: dict[Knob, float] = MISSING     # a dict of plain values: just a leaf, keyed the same way
 ```
 
 In YAML, the table names its entry class once and its entries name nothing:
 
 ```yaml
-axes:
-  _schema: dict[str, sweep.Axis]     # not "axes IS an Axis" — every entry below is one
+axes > dict[sweep.Knob, sweep.Axis]:   # not "axes IS an Axis" — every entry below is one
   lr:    {values: [1e-4, 3e-4]}
   depth: {values: [12, 24]}
 ```
 
-Both halves of a `dict[...]` are import paths, `str` aside, so an `Enum`-keyed table is written
-`_schema: dict[myproject.tasks.Task, sweep.Axis]`. The key is imported and checked against the type the
-field declared — not matched by name, which would put one word in the file that names nothing a reader
-can open.
+Both halves of a `dict[...]` are import paths, with no exception: the key is imported and checked
+against the type the field declared — not matched by name, which would put one word in the file that
+names nothing a reader can open. A key is written as the member's VALUE, the same spelling an `Enum`
+has anywhere else in a config, so a value with a dot or a dash in it (`flux.1-dev`) is written as
+itself.
 
 A table needs no `default_factory` — its entries do not exist until a config file names their keys —
 and a `_default:` mounts on one *entry* (`axes.lr`), never on the table itself, which has no single
@@ -208,7 +217,7 @@ composition is recursive, and cycles are caught.
 
 ```yaml
 # configs/optim/cosine.yaml        # configs/train_7b.yaml
-_schema: train.Optim               _schema: train.TrainConfig
+_ > train.Optim:                   _ > train.TrainConfig:
 lr: 2.0e-4                         _default: configs/train.yaml
 warmup_steps: 100                  model: llama-3-7b
                                    optim:
@@ -222,12 +231,12 @@ neither: which of them set the value in front of you is answered by counting pos
 file that may itself be inherited. Combining independent fragments is still explicit, it just happens
 at the launch — `run` takes several config files at once, so the command line shows what went in.
 
-A block that mounts a fragment needs no `_schema:` of its own, as `optim:` above does not: the fragment
+A block that mounts a fragment declares nothing of its own, as `optim:` above does not: the fragment
 it names already names the class, at that node. The rule is that every block filling a config class is
 named — once, by whoever is in a position to say it.
 
 Because the mount point is named by the *parent*, a shared fragment states its own fields at its own
-top level and does not have to know where it will land. That is what the `_schema:` line buys: the
+top level and does not have to know where it will land. That is what the declaration buys: the
 fragment says it is an `Optim`, the parent says an `Optim` goes under `optim:`, and a fragment
 mounted at the wrong block is an error naming both:
 
@@ -277,7 +286,7 @@ python train.py configs/train.yaml optim.lr=1e-4 --run-dir runs/exp1
 
 ```
 runs/exp1/
-├── config.yaml           # the exact resolved config, `_schema:` line and all — a config file like
+├── config.yaml           # the exact resolved config, declarations and all — a config file like
 │                         #   any other: `python train.py runs/exp1/config.yaml --run-dir runs/redo`
 ├── metadata.json         # argv, cwd, run dir, git commit + dirty flag, start time, host
 ├── train.log             # everything the run printed
@@ -289,7 +298,7 @@ runs/exp1/
 | Input | What it is |
 | --- | --- |
 | `function` | the routine to run. Its **first argument is annotated with its config class** — the function *is* its config, so `run` reads the schema off that annotation and there is nothing else to name. An optional **second argument, `run_dir: str`**, is the folder. Returns this process's exit status (`None` → 0). |
-| `config` | the YAML file to load it from. Omitted, it comes off the command line (`<config.yaml> [key=value ...]`) — the usual way a script is launched. |
+| `config` | the YAML file to load it from. Omitted, it comes off the command line (`<config.yaml> [key=value ...]`) — the usual way a script is launched. A schema whose every field has a default needs no file at all: `python train.py` is then a run of those defaults, `key=value` still wins over them, and the snapshot in the run folder lists every field as always. A schema still holding a `MISSING` field answers a bare launch by naming it. |
 | `run_dir=` | the folder this run owns: a path, or a **function** returning one — of the loaded config, and of the config file itself if it takes a second argument. `--run-dir PATH` on the command line wins over it; one of the two must say, or the launch stops. |
 | `log=` | the log file inside that folder, `None` for no log. `--log NAME` and `--no-log` win over it — the latter is how a distributed launch says "not every rank appends to one file". |
 
@@ -366,7 +375,7 @@ that made it. The snapshot is best-effort — provenance never aborts a run.
 | `schema_of(path)` | the class a config file was written for, without loading it |
 | `start_run(run_dir, config)` | create the run folder, write `config.yaml` + `metadata.json` |
 | `tee_stdout(path, banner=None)` | context manager: also append stdout to `path` |
-| `compose(path[, node])` | one YAML → the composed `DictConfig`, every `_schema:` claim in it, and every key it sets, each attached to the file that wrote it |
+| `compose(path[, node])` | one YAML → the composed `DictConfig`, every declaration in it, and every key it sets, each attached to the file that wrote it |
 | `load_mapping_yaml(path)` | the same, keeping only the `DictConfig` |
 | `load_yaml(path)` | one YAML → `dict`, plain PyYAML, no composition |
 | `partial_of(cls[, name])` | the schema of one LAYER of `cls`: a subclass whose fields may be left unset |
@@ -380,13 +389,13 @@ handful of free functions each doing one call:
 
 | | |
 | --- | --- |
-| `.name` | the dotted path a `_schema:` line names this class by |
+| `.name` | the dotted path a declaration names this class by |
 | `.fields` | each field's `Shape`: `value`, `group`, or `table` (of what class, keyed by what) |
 | `.check()` | reject a class that cannot be filled from a YAML file, nesting and all |
 | `.at(node)` | what a node lands on, as a `Shape` — including `unknown` |
 | `.require(node)` | the class that belongs at a node; raises if that node is not one |
-| `Schema.resolve(dotted)` | import the class a `_schema:` line names |
-| `Schema.declared(text)` | read a whole `_schema:` line: the class, and the keys if it spells a table |
+| `Schema.resolve(dotted)` | import the class a declaration names |
+| `Schema.declared(text)` | read a whole declaration: the class, and the keys if it spells a table |
 
 A *node* is where something sits in a config, spelled as the sequence of keys — `("overrides",
 "model", "flux.1-dev")`. A dotted string is accepted too and split on `.`, which is the convenient
@@ -395,7 +404,7 @@ mapping knows whether `flux.1-dev` is one key or two, so `compose` reports the k
 
 A *spec* is a YAML file path, a `dotted.key=value` string, or a ready-made mapping/`DictConfig` —
 so a caller can merge values it computed at runtime under the same "later wins" rule. A mapping spec
-needs no `_schema:`: values a routine computed are code, and code is already typed.
+declares nothing: values a routine computed are code, and code is already typed.
 
 ## Development
 

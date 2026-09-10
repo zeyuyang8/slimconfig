@@ -1,5 +1,5 @@
 # The config classes the tests load. A module, not a conftest fixture, because a YAML names its class by
-# dotted import path (`_schema: fixtures.TrainConfig`) and that has to be importable.
+# dotted import path (`_ > fixtures.TrainConfig:`) and that has to be importable.
 
 from __future__ import annotations
 
@@ -45,12 +45,37 @@ class TrainConfig(Config):
     data: Data = field(default_factory=Data)
 
 
+# A schema with nothing left to choose: every field already has the answer, so the class IS a config
+# and a run of it names no file.
+@dataclass
+class Settled(Config):
+    model: str = "llama"
+    steps: int = 10
+
+
 # ── tables and layers ────────────────────────────────────────────────────────
 
 
 class Stage(StrEnum):
     warmup = "warmup"
     main = "main"
+
+
+class Name(StrEnum):
+    llama = "llama"
+    qwen = "qwen"
+
+
+# A key with a DOT in it, which is what makes a dotted node path ambiguous — the enum registers it, and
+# the walk still has to treat it as one key and not two.
+class Backbone(StrEnum):
+    flux_dev = "flux.1-dev"
+    lumina2 = "lumina2"
+
+
+class Column(StrEnum):
+    psnr = "psnr"
+    ssim = "ssim"
 
 
 # One LAYER of a training run: every field of TrainConfig, none of them required.
@@ -63,15 +88,14 @@ class MatrixConfig(Config):
 
     stage: Stage = MISSING
     base: TrainPart = field(default_factory=TrainPart)
-    per_stage: dict[Stage, TrainPart] = MISSING  # enum-keyed: the KEYS are checked too
-    per_model: dict[str, Data] = MISSING  # a table of a COMPLETE class: every entry is whole
+    per_stage: dict[Stage, TrainPart] = MISSING  # a table of a LAYER: an entry may say nothing
+    per_model: dict[Name, Data] = MISSING  # a table of a COMPLETE class: every entry is whole
 
 
-# A table with FREE-FORM string keys whose entries hold a group. That is the shape where a key with a
-# dot in it — `flux.1-dev` — makes a dotted node path ambiguous.
+# A table whose keys have a DOT in them — `flux.1-dev` — which makes a dotted node path ambiguous.
 @dataclass
 class ModelMatrix(Config):
-    per_model: dict[str, TrainPart] = MISSING
+    per_model: dict[Backbone, TrainPart] = MISSING
 
 
 @dataclass
@@ -85,7 +109,7 @@ class Axis(Config):
 @dataclass
 class Search(Config):
     trials: int = MISSING
-    axes: dict[str, Axis] = MISSING
+    axes: dict[Name, Axis] = MISSING
 
 
 SearchPart = partial_of(Search, name="SearchPart")
@@ -102,8 +126,8 @@ class SearchMatrix(Config):
 # a list or another mapping.
 @dataclass
 class Report(Config):
-    metrics: dict[str, list[str]] = MISSING
-    weights: dict[str, float] = MISSING
+    metrics: dict[Column, list[str]] = MISSING
+    weights: dict[Column, float] = MISSING
     labels: list[str | int] = MISSING  # a union of scalars: any member will do, and nothing else
 
 

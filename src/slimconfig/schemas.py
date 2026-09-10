@@ -4,10 +4,15 @@
 #
 #   a LEAF     a scalar, a list, a dict of values — a value.
 #   a GROUP    another config class: a named group of values, nested.
-#   a TABLE    `dict[str, C]` (or `dict[SomeEnum, C]`) for a config class C: SEVERAL of that group,
-#              keyed — one entry per model, per method, per whatever the keys name. The entries are
-#              validated exactly like a group is (unknown key rejected, types checked), and an Enum key
-#              type means the KEYS are checked too.
+#   a TABLE    `dict[SomeEnum, C]` for a config class C: SEVERAL of that group, keyed — one entry per
+#              model, per method, per whatever the Enum names. The entries are validated exactly like a
+#              group is (unknown key rejected, types checked), and the keys are checked too.
+#
+# EVERY KEY A CONFIG FILE WRITES IS REGISTERED SOMEWHERE — a field of a config class, or a member of an
+# Enum. That is why a mapping, leaf or table, is keyed by an Enum and never by a bare `str`: a
+# `dict[str, ...]` takes any word at all, and a word nothing declared is one a reader cannot look up and
+# a typo nothing can catch. It reads as a set of choices and behaves as a hole. Such a key is written in
+# YAML as the member's VALUE, the same spelling the Enum has anywhere else in a config.
 #
 # Nothing else is a config. That is the whole shape rule, and `Schema.check` enforces it before a load,
 # so a schema that cannot be filled from YAML says so at import time rather than deep inside a merge.
@@ -29,13 +34,13 @@
 # fields, whether it is well formed, which class sits at a given node of it — is a method of `Schema`,
 # so those questions are asked the same way everywhere instead of through free functions each
 # re-deriving the same walk. What is left at module level is what is not about one class: the naming
-# rules (`schema_name` and the `_schema:` line it writes), and the declaration rules, which run at the
+# rules (`schema_name` and the declaration it writes), and the declaration rules, which run at the
 # `class` statement, before any Schema exists.
 #
 # ONE THING TO KNOW ABOUT MERGING A LEAF THAT IS A MAPPING. Every mapping merges key by key — that is
 # OmegaConf's rule and slimconfig does not change it — so a later spec setting `weights: {a: 1, b: 1}`
 # on top of `{a: 1, c: 1}` yields all three keys, not two. For a GROUP or a TABLE that is exactly right.
-# For a leaf that happens to be a `dict[str, float]` it is usually not what the writer meant: such a
+# For a leaf that happens to be a `dict[SomeEnum, float]` it is usually not what the writer meant: such a
 # layer can ADD a key but never DROP one. If a mapping-valued leaf is a set of things and a config needs
 # to state a different set, do not layer it — give each variant its own whole value, at a node where
 # only one variant can apply.
@@ -50,9 +55,9 @@
 # NAMING A CLASS FROM YAML. Every config file, and every mapping in one that fills a config class,
 # states which class — and, because a group and a table are the same mapping shape on the page, the
 # declaration says which of the two it is:
-#     _schema: myproject.train.OptimConfig             this mapping IS an OptimConfig
-#     _schema: dict[str, myproject.train.Data]         its ENTRIES each are a Data, keyed by str
-#     _schema: dict[myproject.tasks.Task, ...Data]     the same, keyed by an Enum — named in full too
+#     optim > myproject.train.OptimConfig:          this mapping IS an OptimConfig
+#     data > dict[myproject.tasks.Task, ...Data]:   its ENTRIES each are a Data, keyed by that Enum
+# A file names its own class the same way, on the reserved key `_`: `_ > myproject.train.TrainConfig:`.
 # The second spelling is the field's own annotation, written out, so a table names its entry class once
 # for all of its entries instead of once per entry — and an entry, whose class the table already fixed,
 # names nothing. `Schema.declared` reads a line; `Schema.resolve` imports the class in it;
@@ -82,6 +87,7 @@ __all__ = [
     "check_declaration",
     "declaration_name",
     "key_name",
+    "optional",
     "schema_name",
     "value_error",
 ]
@@ -115,10 +121,10 @@ _TABLE = re.compile(r"dict\[\s*(?P<key>[\w.]+)\s*,\s*(?P<value>[\w.]+)\s*\]")
 
 
 class Declaration(NamedTuple):
-    """What one `_schema:` line SAYS the mapping under it is:
+    """What one declaration SAYS the mapping under it is:
 
-        _schema: pkg.module.Optim            Declaration(Schema(Optim), None)   — this mapping IS one
-        _schema: dict[str, pkg.module.Data]  Declaration(Schema(Data), str)     — its ENTRIES each are
+        optim > pkg.module.Optim:            Declaration(Schema(Optim), None)   — this mapping IS one
+        data > dict[pkg.mod.Task, ...Data]:  Declaration(Schema(Data), Task)    — its ENTRIES each are
     """
 
     schema: Schema
@@ -176,35 +182,34 @@ def schema_name(cls: type) -> str:
 # How a YAML declares a mapping of `cls`: the class's dotted path for ONE of it, `dict[K, path]` for a
 # table of them. The two spellings are what tell a block filling a group apart from a table whose every
 # entry fills one — the same mapping shape, and without the `dict[...]` a reader cannot say which they
-# are looking at. Both names in a `dict[...]` are import paths, `str` aside: a key type spelled as a bare
-# word would be the one name in a config file that names nothing a reader can open.
+# are looking at. BOTH names in a `dict[...]` are import paths, with no exception: a key type spelled as
+# a bare word would be the one name in a config file that names nothing a reader can open.
 def declaration_name(cls: type, key: type | None = None) -> str:
     return schema_name(cls) if key is None else f"dict[{key_name(key)}, {schema_name(cls)}]"
 
 
-# How a `dict[...]` names the type its keys have: `str` as itself, an Enum by its dotted path.
+# How a `dict[...]` names the type its keys have: the Enum's dotted path.
 def key_name(key: type) -> str:
-    return "str" if key is str else schema_name(key)
+    return schema_name(key)
 
 
 # The other half of a `dict[...]`: the type a table's keys have, imported the same way the entry class
-# beside it is. `str` is itself; anything else is an Enum named in full. Resolving it rather than
-# comparing spellings is what makes the declaration checkable AND followable — the check is then whether
-# the file named the same TYPE the field declared, and a reader can open the name to see the keys.
+# beside it is — an Enum, named in full. Resolving it rather than comparing spellings is what makes the
+# declaration checkable AND followable: the check is then whether the file named the same TYPE the field
+# declared, and a reader can open the name to see which keys there are.
 def _resolve_key(dotted: str, spelled: str) -> type:
-    obj = str if dotted == "str" else _import_dotted(dotted)
-    if isinstance(obj, type) and (obj is str or issubclass(obj, enum.Enum)):
+    obj = _import_dotted(dotted)
+    if isinstance(obj, type) and issubclass(obj, enum.Enum):
         return obj
     raise ValueError(
-        f"`_schema: {spelled}` does not say what the keys are: a table is keyed by `str` or by an Enum "
-        f"named in full, as its entry class is (`dict[pkg.module.TaskName, pkg.module.Cell]`), and "
-        f"{dotted!r} is neither"
+        f"`{spelled}` does not say what the keys are: a table is keyed by an Enum named in full, as its "
+        f"entry class is (`dict[pkg.module.TaskName, pkg.module.Cell]`), and {dotted!r} is not one"
     )
 
 
 # `X | None` -> X. Anything else — including a union of several real types — is handed back as it is,
 # for the caller to classify or to reject.
-def _optional(annotation: Any) -> Any:
+def optional(annotation: Any) -> Any:
     if get_origin(annotation) in (Union, types.UnionType):
         inner = [a for a in get_args(annotation) if a is not type(None)]
         if len(inner) == 1:
@@ -215,7 +220,7 @@ def _optional(annotation: Any) -> Any:
 # What an annotation describes — a value, a nested config class, or a table of one. `X | None` counts as
 # whatever X is: an optional group is still a group, and OmegaConf nests it the same way.
 def _shape_of(annotation: Any) -> Shape:
-    annotation = _optional(annotation)
+    annotation = optional(annotation)
     if dataclasses.is_dataclass(annotation) and isinstance(annotation, type):
         return Shape("group", annotation)
     if get_origin(annotation) is dict:
@@ -280,20 +285,24 @@ def _value_error(annotation: Any) -> str | None:
     if annotation is Any or annotation is object:
         return "it says nothing about the value — name the type the config actually holds"
     if annotation is list or annotation is dict:
-        example = "list[str]" if annotation is list else "dict[str, float]"
+        example = "list[str]" if annotation is list else "dict[pkg.module.SomeEnum, float]"
         return f"it does not say what it holds — write `{example}`"
     if origin is list:
         held = get_args(annotation)[0]
         if dataclasses.is_dataclass(held):
             return (
                 f"a list of config classes is not one of the three shapes — key them instead, as a "
-                f"table: `dict[str, {_shown(held)}]`"
+                f"table: `dict[pkg.module.SomeEnum, {_shown(held)}]`"
             )
         return _value_error(held)
     if origin is dict:
         key, held = get_args(annotation)
-        if not (key is str or key is int or _is_enum(key)):
-            return f"a config key is a str, an int or an Enum, not {_shown(key)}"
+        if not _is_enum(key):
+            return (
+                f"a mapping is keyed by an Enum, not by {_shown(key)} — every key a config file writes "
+                f"is registered somewhere, a field of a class or a member of an Enum, and a key typed "
+                f"{_shown(key)} is a word from nowhere that nothing can check"
+            )
         if dataclasses.is_dataclass(held):
             return (
                 f"a table of {_shown(held)} is a FIELD of a config class, not something nested inside "
@@ -320,11 +329,11 @@ def _value_error(annotation: Any) -> str | None:
 
 # Why `value` is not what `annotation` promised — None if it is. The other half of the rule above: a
 # declaration is worth what is checked against it, and OmegaConf checks a scalar but will happily let a
-# `list[str]` hold a mapping and a `dict[str, str]` hold a list. The message is a SUFFIX, so a caller
+# `list[str]` hold a mapping and a `dict[K, str]` hold a list. The message is a SUFFIX, so a caller
 # that knows the field's name can print the whole path to the value that is wrong: `tags[1] is not a
 # str: {'a': 1}`.
 def value_error(value: Any, annotation: Any) -> str | None:
-    ann = _optional(annotation)
+    ann = optional(annotation)
     if value is None:  # whether null is allowed at all is OmegaConf's own check, at merge time
         return None
     origin = get_origin(ann)
@@ -342,7 +351,8 @@ def value_error(value: Any, annotation: Any) -> str | None:
         if not isinstance(value, dict):
             return f" is not a mapping: {value!r}"
         held = get_args(ann)[1]
-        return next((f"[{k!r}]{p}" for k, v in value.items() if (p := value_error(v, held))), None)
+        shown = {k: repr(k.value if isinstance(k, enum.Enum) else k) for k in value}
+        return next((f"[{shown[k]}]{p}" for k, v in value.items() if (p := value_error(v, held))), None)
     if _is_enum(ann):
         return None if isinstance(value, ann) else f" is not a {ann.__name__}: {value!r}"
     if ann is bool:
@@ -392,10 +402,11 @@ def _declaration_error(owner: str, name: str, annotation: Any, default: Any) -> 
             )
         return None
     if kind == "table":
-        if not (key is str or _is_enum(key)):
+        if not _is_enum(key):
             return (
-                f"{where} is a table keyed by {_shown(key)} — a key names one of several groups, so it "
-                "is a str or an Enum"
+                f"{where} is a table keyed by {_shown(key)} — a key names one of several groups, and "
+                f"every key a config file writes is registered somewhere, so it is an Enum whose members "
+                f"are the entries this table may have"
             )
         return None
     problem = _value_error(annotation)
@@ -466,7 +477,7 @@ class Schema:
         Schema(TrainConfig).at("optim.lr")       -> Shape("value", None)
         Schema(TrainConfig).require("optim")     -> Schema(Optim)
         Schema.resolve("myproject.train.Optim")  -> Schema(Optim)
-        Schema.declared("dict[str, ....Data]")   -> Declaration(Schema(Data), str)
+        Schema.declared("dict[..Task, ..Data]")  -> Declaration(Schema(Data), Task)
 
     A Schema wraps a class and holds nothing else, so two of the same class are equal and either may be
     built wherever it is wanted; nothing is cached that a reloaded module could make stale.
@@ -487,23 +498,23 @@ class Schema:
 
     # ── naming ───────────────────────────────────────────────────────────────
 
-    # Import the config class a `_schema:` line names.
+    # Import the config class a declaration names.
     @classmethod
     def resolve(cls, dotted: str) -> Schema:
         if not isinstance(dotted, str) or not dotted.strip():
-            raise ValueError(f"`_schema` must be the dotted import path of a config class, got {dotted!r}")
+            raise ValueError(f"a declaration must be the dotted import path of a config class, got {dotted!r}")
         dotted = dotted.strip()
         if len(dotted.split(".")) < 2:
             raise ValueError(
-                f"`_schema: {dotted}` is not a dotted import path — name the class in full, "
-                "e.g. `_schema: myproject.train.OptimConfig`"
+                f"`{dotted}` is not a dotted import path — name the class in full, "
+                "e.g. `optim > myproject.train.OptimConfig:`"
             )
         obj = _import_dotted(dotted)
         if obj is None:
-            raise ValueError(f"`_schema: {dotted}` could not be imported — no such module or attribute")
+            raise ValueError(f"`{dotted}` could not be imported — no such module or attribute")
         if not (dataclasses.is_dataclass(obj) and _subclasses_config(obj)):
             raise ValueError(
-                f"`_schema: {dotted}` names {obj!r}, which is not a config class "
+                f"`{dotted}` names {obj!r}, which is not a config class "
                 "(a @dataclass subclassing slimconfig.Config)"
             )
         return cls(obj)
@@ -512,12 +523,12 @@ class Schema:
     def name(self) -> str:
         return schema_name(self.cls)
 
-    # Read one `_schema:` line: the class it names, and — if it spells a table — what it says the keys
+    # Read one declaration: the class it names, and — if it spells a table — what it says the keys
     # are. `resolve` answers the first half and is what a group needs; this answers the whole line.
     @classmethod
     def declared(cls, text: str) -> Declaration:
         if not isinstance(text, str) or not text.strip():
-            raise ValueError(f"`_schema` must be the dotted import path of a config class, got {text!r}")
+            raise ValueError(f"a declaration must be the dotted import path of a config class, got {text!r}")
         spelled = text.strip()
         table = _TABLE.fullmatch(spelled)
         if table is not None:
@@ -528,8 +539,9 @@ class Schema:
                 if spelled.startswith("list[") else ""
             )
             raise ValueError(
-                f"`_schema: {spelled}` is neither a config class nor a table of one — write "
-                f"`pkg.module.Class` for a mapping that IS one, or `dict[str, pkg.module.Class]` for a "
+                f"`{spelled}` is neither a config class nor a table of one — write "
+                f"`pkg.module.Class` for a mapping that IS one, or `dict[pkg.module.SomeEnum, "
+                f"pkg.module.Class]` for a "
                 f"table whose every entry is one.{listed}"
             )
         return Declaration(cls.resolve(spelled), None)
@@ -543,7 +555,7 @@ class Schema:
         return {f.name: _shape_of(hints.get(f.name, f.type)) for f in dataclasses.fields(self.cls)}
 
     # The annotations themselves, for the one question `fields` cannot answer: not what SHAPE a field
-    # holds but exactly which type it promised — `list[str]` and `dict[str, float]` are both leaves.
+    # holds but exactly which type it promised — `list[str]` and `dict[K, float]` are both leaves.
     @property
     def hints(self) -> dict[str, Any]:
         return get_type_hints(self.cls)

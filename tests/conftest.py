@@ -9,10 +9,8 @@ import pytest
 @pytest.fixture
 def write():
     def _write(path, text: str, schema: str | None = "fixtures.TrainConfig") -> str:
-        # Only a TOP-LEVEL line counts: a body may restate `_schema:` inside a nested block and still
-        # need the file's own.
-        if schema is not None and not any(line.startswith("_schema:") for line in text.splitlines()):
-            text = f"_schema: {schema}\n{text.lstrip(chr(10))}"
+        if schema is not None and not any(line.startswith("_ >") for line in text.splitlines()):
+            text = f"_ > {schema}:\n{text.lstrip(chr(10))}"
         path.write_text(text, encoding="utf-8")
         return str(path)
 

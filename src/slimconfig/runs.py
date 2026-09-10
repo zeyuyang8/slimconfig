@@ -36,7 +36,7 @@ from typing import Any, NoReturn, cast, get_type_hints
 
 from omegaconf import DictConfig, OmegaConf
 
-from .config import SCHEMA_KEY
+from .config import ARROW, ROOT_NAME
 from .schemas import Config, Schema, Shape, declaration_name
 from .structured import Spec, load_config
 
@@ -85,32 +85,36 @@ def _as_dictconfig(config: Any) -> DictConfig:
     raise TypeError(f"cannot snapshot config of type {type(config).__name__}")
 
 
-# The `_schema:` lines that make a snapshot a config file like any other, so a run can be repeated from
-# its own folder (`python train.py <run_dir>/config.yaml --run-dir <somewhere>`). Every mapping that
-# fills a config class gets one, exactly as a hand-written config must — a snapshot missing them would
-# not reload, which is the strongest possible check that the rule is the same on both sides. A block
-# names its class; a table names `dict[<key>, <class>]`, once, for all of its entries; an entry names
-# nothing, since the table above it already said. `_schema` is written FIRST in each mapping, where a
-# reader looks for it.
+# The declarations that make a snapshot a config file like any other, so a run can be repeated from its
+# own folder (`python train.py <run_dir>/config.yaml --run-dir <somewhere>`). Every mapping that fills a
+# config class gets one, exactly as a hand-written config must — a snapshot missing them would not
+# reload, which is the strongest possible check that the rule is the same on both sides. A block names
+# its class on its own key; a table names `dict[<key>, <class>]`, once, for all of its entries; an entry
+# names nothing, since the table above it already said.
 #
 # What the SCHEMA says a field holds only tells us where a block WOULD be; the value has to be one. A
 # partial (`partial_of`) leaves fields unset, and an unset group or table comes out of to_container as
 # the string "???" — there is no block there to name, so it is written through as it is.
-def _stamp(node: Mapping[str, Any], schema: Schema, tag: str | None = None) -> dict[str, Any]:
-    out: dict[str, Any] = {} if tag is None else {SCHEMA_KEY: tag}
+def _stamp(node: Mapping[str, Any], schema: Schema) -> dict[str, Any]:
+    out: dict[str, Any] = {}
     fields = schema.fields
     for key, value in node.items():
         held = fields.get(key, Shape("value", None))
         if held.cls is None or not isinstance(value, Mapping):
             out[key] = value
         elif held.kind == "group":
-            out[key] = _stamp(value, Schema(held.cls), declaration_name(held.cls))
-        else:  # a table: tagged once, here; its entries are not, but any group INSIDE one still is
-            out[key] = {SCHEMA_KEY: declaration_name(held.cls, held.key)} | {
+            out[_declares(key, held.cls)] = _stamp(value, Schema(held.cls))
+        else:  # a table: declared once, here; its entries are not, but any group INSIDE one still is
+            out[_declares(key, held.cls, held.key)] = {
                 k: _stamp(v, Schema(held.cls)) if isinstance(v, Mapping) else v
                 for k, v in value.items()
             }
     return out
+
+
+# One key, declaring what the mapping under it is.
+def _declares(key: str, cls: type, table_key: type | None = None) -> str:
+    return f"{key} {ARROW} {declaration_name(cls, table_key)}"
 
 
 # The snapshot's YAML text. A config that is not a config-class instance — a mapping or a plain
@@ -121,7 +125,8 @@ def _snapshot(config: Any) -> str:
         return OmegaConf.to_yaml(node, resolve=True)
     container = OmegaConf.to_container(node, resolve=True, enum_to_str=True)
     root = Schema(type(config))
-    return OmegaConf.to_yaml(OmegaConf.create(_stamp(cast(Mapping, container), root, root.name)))
+    body = OmegaConf.to_yaml(OmegaConf.create(_stamp(cast(Mapping, container), root)))
+    return f"{_declares(ROOT_NAME, type(config))}:\n{body}"
 
 
 # Open the run's folder and record what produced it. Writes two files:
@@ -354,6 +359,8 @@ def _usage(extra: str = "") -> NoReturn:
 #              fragments are combined, since a file inherits only one (`_default:` in config.py). The
 #              difference matters: a chain is a property of the files and lives in them, a combination is
 #              a property of this launch and shows up in its argv (and so in its metadata.json).
+#              NONE may be named either: a schema whose every field has a default is already a config,
+#              so a run with nothing to choose is `python step.py`, and `key=value` still wins over it.
 #   run_dir  — the folder this run owns: a path, or a function returning one — of the loaded config, and
 #              of the config file itself if it takes a second argument (`lambda cfg, path: ...`).
 #              `--run-dir` on the command line wins over it; one of the two must say.
@@ -386,11 +393,19 @@ def run(
     launch = _Launch.parse(list(sys.argv[1:]))
     if config is not None:
         launch = dataclasses.replace(launch, specs=[config])
-    if not launch.specs:
-        _usage()
     specs = cast(list[Spec], [*launch.specs, *(f"{key}={value}" for key, value in overrides.items())])
 
-    cfg = load_config(entry.schema, specs)
+    # Naming nothing is a run of the schema's own defaults, which is a whole config when every field
+    # has one — a step with nothing left to choose is then launched by naming the script, and the
+    # snapshot in its run folder still spells every field out. A schema that is not complete on its
+    # own answers by naming the field it is short of, which is what a reader of a bare launch needs;
+    # the usage line goes under it to say where such a field is filled in.
+    try:
+        cfg = load_config(entry.schema, specs)
+    except ValueError as incomplete:
+        if specs:
+            raise
+        _usage(str(incomplete))
     folder = launch.folder(run_dir, log, cfg)
     with folder.open(cfg):
         status = entry(cfg, folder.path)

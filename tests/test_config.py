@@ -1,4 +1,4 @@
-# The YAML layer: load_yaml / load_mapping_yaml / compose, the `_schema:` and `_default:` keywords, and
+# The YAML layer: load_yaml / load_mapping_yaml / compose, the declarations and the `_default:` keyword,
 # the resolvers. What the claims MEAN is checked against a schema in test_structured.py.
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ def test_load_mapping_yaml_missing_file_is_not_a_parse_error(tmp_path):
         load_mapping_yaml(str(tmp_path / "nope.yaml"))
 
 
-# ── `_schema:` ───────────────────────────────────────────────────────────────
+# ── declarations ─────────────────────────────────────────────────────────────
 
 
 def test_every_config_file_must_name_its_class(tmp_path, write):
@@ -58,9 +58,9 @@ def test_every_config_file_must_name_its_class(tmp_path, write):
         load_mapping_yaml(path)
 
 
-def test_the_schema_line_is_consumed_not_merged(tmp_path, write):
-    cfg = load_mapping_yaml(write(tmp_path / "a.yaml", "a: 1\n"))
-    assert "_schema" not in cfg
+def test_the_declaration_is_consumed_not_merged(tmp_path, write):
+    cfg = load_mapping_yaml(write(tmp_path / "a.yaml", "a: 1\noptim > fixtures.Optim:\n  lr: 1\n"))
+    assert list(cfg) == ["a", "optim"]
 
 
 def test_compose_reports_the_claim_and_where_it_was_made(tmp_path, write):
@@ -71,7 +71,7 @@ def test_compose_reports_the_claim_and_where_it_was_made(tmp_path, write):
 
 
 def test_a_nested_block_may_restate_its_class(tmp_path, write):
-    body = "model: llama\noptim:\n  _schema: fixtures.Optim\n  lr: 0.1\n"
+    body = "model: llama\noptim > fixtures.Optim:\n  lr: 0.1\n"
     claims = compose(write(tmp_path / "a.yaml", body)).claims
     assert [(c.node, c.schema) for c in claims] == [
         ((), "fixtures.TrainConfig"),
@@ -79,9 +79,10 @@ def test_a_nested_block_may_restate_its_class(tmp_path, write):
     ]
 
 
-def test_the_schema_line_must_be_a_string(tmp_path, write):
-    with pytest.raises(ValueError, match="must be a dotted import path"):
-        load_mapping_yaml(write(tmp_path / "a.yaml", "_schema: [a, b]\na: 1\n"))
+def test_the_files_own_declaration_takes_no_value(tmp_path, write):
+    with pytest.raises(ValueError, match="names the file's own class and takes no value"):
+        load_mapping_yaml(write(tmp_path / "a.yaml", "_ > fixtures.TrainConfig: [a, b]\na: 1\n",
+                                schema=None))
 
 
 # ── `_default:` composition ──────────────────────────────────────────────────
@@ -271,7 +272,7 @@ def test_composed_merges_configs_claims_and_keys_together(tmp_path, monkeypatch,
     # A launch that names several files is ONE config assembled from all of them, so merging two
     # compositions merges all three of the things a composition is — and later still wins.
     monkeypatch.chdir(tmp_path)
-    a = compose(write(tmp_path / "a.yaml", "model: llama\noptim:\n  _schema: fixtures.Optim\n  lr: 1\n"))
+    a = compose(write(tmp_path / "a.yaml", "model: llama\noptim > fixtures.Optim:\n  lr: 1\n"))
     b = compose(write(tmp_path / "b.yaml", "model: qwen\n"))
     both = a.merge(b)
     assert both.config.model == "qwen"
@@ -284,7 +285,7 @@ def test_every_key_is_recorded_against_the_file_that_set_it(tmp_path, monkeypatc
     # What a merged config cannot say — which file set `optim.lr` — is kept while the walk still knows
     # it, at every depth and through a `_default:` chain. A mapping is a block; a leaf is not.
     monkeypatch.chdir(tmp_path)
-    base = write(tmp_path / "base.yaml", "model: llama\noptim:\n  _schema: fixtures.Optim\n  lr: 1\n")
+    base = write(tmp_path / "base.yaml", "model: llama\noptim > fixtures.Optim:\n  lr: 1\n")
     child = write(tmp_path / "child.yaml", "_default: base.yaml\nmodel: qwen\n")
     keys = compose(child).keys
     assert (("model",), child, False) in keys
@@ -294,7 +295,7 @@ def test_every_key_is_recorded_against_the_file_that_set_it(tmp_path, monkeypatc
 
 
 def test_composed_of_a_mapping_claims_nothing():
-    # Values a caller computed are code, and code is already typed: no `_schema:` to record, no key to
+    # Values a caller computed are code, and code is already typed: nothing to record, no key to
     # hold against a file — there is no file.
     computed = Composed.of({"model": "llama"})
     assert computed.config.model == "llama"

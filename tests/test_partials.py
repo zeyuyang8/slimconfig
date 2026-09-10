@@ -49,7 +49,7 @@ def _matrix(**overrides):
         "stage": "main",
         "base": {"model": "m", "tags": [], "resume_from": None, "optim": {"lr": 0.1}},
         "per_stage": {"main": {"optim": {"warmup_steps": 10}}},
-        "per_model": {"flux": {"path": "/data/flux"}},
+        "per_model": {"llama": {"path": "/data/llama"}},
         **overrides,
     }])
 
@@ -90,8 +90,8 @@ def test_a_table_key_is_validated_against_the_enum():
 
 def test_a_table_of_a_complete_class_is_still_complete():
     # per_model holds Data, not a layer of it — leaving a field out of an entry is the usual error.
-    with pytest.raises(ValueError, match=r"missing required field\(s\): per_model.flux.path"):
-        _matrix(per_model={"flux": {}})
+    with pytest.raises(ValueError, match=r"missing required field\(s\): per_model.llama.path"):
+        _matrix(per_model={"llama": {}})
 
 
 def test_a_partial_inside_a_run_does_not_make_the_run_optional():

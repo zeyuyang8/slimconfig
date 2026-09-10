@@ -119,7 +119,8 @@ def test_a_broken_module_is_not_reported_as_a_missing_one(tmp_path, monkeypatch)
 
 def test_declared_reads_a_schema_line_as_one_class_or_a_table_of_them():
     assert Schema.declared("fixtures.Data") == Declaration(Schema(fixtures.Data), None)
-    assert Schema.declared(" dict[ str , fixtures.Data ] ") == Declaration(Schema(fixtures.Data), str)
+    spaced = " dict[ fixtures.Name , fixtures.Data ] "
+    assert Schema.declared(spaced) == Declaration(Schema(fixtures.Data), fixtures.Name)
     assert Schema.declared("dict[fixtures.Stage, fixtures.TrainPart]").key is fixtures.Stage
 
 
@@ -127,21 +128,23 @@ def test_declared_rejects_a_shape_that_is_neither():
     with pytest.raises(ValueError, match="key them, as a table"):
         Schema.declared("list[fixtures.Data]")
     with pytest.raises(ValueError, match="neither a config class nor a table of one"):
-        Schema.declared("dict[str, int, fixtures.Data]")
+        Schema.declared("dict[fixtures.Name, int, fixtures.Data]")
 
 
 def test_a_key_is_imported_like_the_class_beside_it_not_matched_by_name():
     # The key type is a name in a config file, so it is a name that can be opened: an Enum is named in
     # full, and its bare name — which points at nothing a reader could find — is not a spelling at all.
-    with pytest.raises(ValueError, match=r"'Stage' is neither"):
+    with pytest.raises(ValueError, match=r"'Stage' is not one"):
         Schema.declared("dict[Stage, fixtures.TrainPart]")
-    with pytest.raises(ValueError, match=r"keyed by `str` or by an Enum"):
+    with pytest.raises(ValueError, match=r"keyed by an Enum named in full"):
         Schema.declared("dict[fixtures.Data, fixtures.TrainPart]")
+    with pytest.raises(ValueError, match=r"keyed by an Enum named in full"):
+        Schema.declared("dict[str, fixtures.TrainPart]")
 
 
 def test_declaration_name_is_the_spelling_declared_reads_back():
     assert declaration_name(fixtures.Data) == "fixtures.Data"
-    assert declaration_name(fixtures.Data, str) == "dict[str, fixtures.Data]"
+    assert declaration_name(fixtures.Data, fixtures.Name) == "dict[fixtures.Name, fixtures.Data]"
     spelled = declaration_name(fixtures.TrainPart, fixtures.Stage)
     assert spelled == "dict[fixtures.Stage, fixtures.TrainPart]"
     assert Schema.declared(spelled) == Declaration(Schema(fixtures.TrainPart), fixtures.Stage)
@@ -154,13 +157,13 @@ def test_fields_tells_the_three_shapes_apart():
     fields = Schema(fixtures.MatrixConfig).fields
     assert fields["stage"] == Shape("value", None)
     assert fields["base"] == Shape("group", fixtures.TrainPart)
-    assert fields["per_model"] == Shape("table", fixtures.Data, str)  # a table also says what keys it takes
+    assert fields["per_model"] == Shape("table", fixtures.Data, fixtures.Name)  # also: what keys it takes
 
 
 def test_a_dict_of_plain_values_is_a_leaf():
     @dataclass
     class WithWeights(Config):
-        weights: dict[str, float] = MISSING
+        weights: dict[fixtures.Column, float] = MISSING
 
     assert Schema(WithWeights).fields["weights"] == Shape("value", None)
 
@@ -172,11 +175,11 @@ def test_at_says_what_a_path_lands_on_without_raising():
     root = Schema(fixtures.MatrixConfig)
     assert root.at("") == Shape("group", fixtures.MatrixConfig)
     assert root.at("stage") == Shape("value", None)
-    assert root.at("per_model") == Shape("table", fixtures.Data, str)
-    assert root.at("per_model.flux") == Shape("entry", fixtures.Data)
+    assert root.at("per_model") == Shape("table", fixtures.Data, fixtures.Name)
+    assert root.at("per_model.llama") == Shape("entry", fixtures.Data)
     assert root.at("nope") == Shape("unknown", None)
     assert root.at("stage.deeper") == Shape("unknown", None)  # nothing below a leaf is a node
-    assert root.at(("per_model", "flux.1-dev")) == Shape("entry", fixtures.Data)
+    assert Schema(fixtures.ModelMatrix).at(("per_model", "flux.1-dev")) == Shape("entry", fixtures.TrainPart)
 
 
 def test_the_empty_path_is_the_root_itself():
@@ -199,12 +202,12 @@ def test_a_leaf_is_not_a_group():
 
 def test_a_table_entry_walks_to_the_entry_class():
     root = Schema(fixtures.MatrixConfig)
-    assert root.require("per_model.flux") == Schema(fixtures.Data)
+    assert root.require("per_model.llama") == Schema(fixtures.Data)
     assert root.require("per_stage.main.optim") == Schema(fixtures.TrainPart.OptimPart)
 
 
 def test_the_table_itself_has_no_class_to_fill():
     # `per_model` is however many Datas the keys name, not one config — so a file cannot be mounted on it,
     # and the error offers both ways to say what it is: the shape, or one entry.
-    with pytest.raises(ValueError, match=r"`dict\[str, fixtures.Data\]`.*`per_model.<key>`"):
+    with pytest.raises(ValueError, match=r"`dict\[fixtures.Name, fixtures.Data\]`.*`per_model.<key>`"):
         Schema(fixtures.MatrixConfig).require("per_model")

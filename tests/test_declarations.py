@@ -29,7 +29,7 @@ def test_a_group_must_be_a_config_class():
 
 def test_a_table_entry_must_be_a_config_class():
     with pytest.raises(TypeError, match="does not subclass slimconfig.Config"):
-        fixtures.declare(dict[str, fixtures.PlainDataclass])
+        fixtures.declare(dict[fixtures.Name, fixtures.PlainDataclass])
 
 
 def test_a_config_class_is_checked_at_its_class_statement(tmp_path, monkeypatch):
@@ -61,7 +61,7 @@ def test_a_config_class_is_checked_at_its_class_statement(tmp_path, monkeypatch)
         (Any, "says nothing about the value"),
         (object, "says nothing about the value"),
         (list, "does not say what it holds.*list\\[str\\]"),
-        (dict, "does not say what it holds.*dict\\[str, float\\]"),
+        (dict, "does not say what it holds.*dict\\[pkg.module.SomeEnum, float\\]"),
         (Path, "does not survive the run snapshot"),
         (tuple[str, ...], "a sequence in a config is a `list"),
         (set[str], "a sequence in a config is a `list"),
@@ -70,10 +70,12 @@ def test_a_config_class_is_checked_at_its_class_statement(tmp_path, monkeypatch)
         (list[str] | int, "a union may only offer scalars"),
         (fixtures.Data | int, "a union may only offer scalars"),
         (list[Path], "does not survive the run snapshot"),
-        (dict[str, Any], "says nothing about the value"),
+        (dict[fixtures.Column, Any], "says nothing about the value"),
         (list[fixtures.Data], "key them instead, as a table"),
-        (list[dict[str, fixtures.Data]], "is a FIELD of a config class"),
-        (dict[float, str], "a config key is a str, an int or an Enum"),
+        (list[dict[fixtures.Name, fixtures.Data]], "is a FIELD of a config class"),
+        (dict[float, str], "a mapping is keyed by an Enum"),
+        (dict[str, float], "a mapping is keyed by an Enum"),
+        (dict[int, str], "a mapping is keyed by an Enum"),
         (complex, "not a type a YAML value can have"),
     ],
 )
@@ -93,9 +95,8 @@ def test_a_hint_a_config_file_cannot_state_is_rejected(annotation, match):
         str | None,
         list[str],
         list[str] | None,
-        dict[str, float],
-        dict[str, list[str]],
-        dict[int, str],
+        dict[fixtures.Column, float],
+        dict[fixtures.Column, list[str]],
         list[list[int]],
         str | int | float,  # a union of scalars: OmegaConf holds it and checks it
         list[str | int] | None,
@@ -207,8 +208,8 @@ def test_a_name_that_never_appears_is_caught_before_a_load(tmp_path, monkeypatch
 
 FULL = (
     "model: llama\ntags: []\nresume_from: null\n"
-    "optim:\n  _schema: fixtures.Optim\n  lr: 0.1\n  warmup_steps: 1\n"
-    "data:\n  _schema: fixtures.Data\n  path: d\n"
+    "optim > fixtures.Optim:\n  lr: 0.1\n  warmup_steps: 1\n"
+    "data > fixtures.Data:\n  path: d\n"
 )
 REPORT = "metrics:\n  psnr: [good]\nweights:\n  psnr: 1.0\nlabels: [a, 1]\n"
 
