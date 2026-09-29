@@ -234,19 +234,41 @@ class Run(abc.ABC):
 
     The class form of a `run` function, for a routine whose work is several methods sharing state. A
     subclass annotates `config` with its config class — the same promise a function's first argument
-    makes — implements `main`, and is handed to `run` in place of a function: `run(Train)`.
+    makes — and implements `main`. An instance is built with what `run` takes besides the function
+    (the config file, `run_dir=`, `log=`, overrides), and `.run()` launches it:
+
+        Train(log="train.log").run()
+
+    `.run()` loads `config`, opens the folder as `run_dir`, calls `main`, and exits with its status.
     """
 
     config: Config
     run_dir: str
 
-    def __init__(self, config: Config, run_dir: str) -> None:
-        self.config = config
-        self.run_dir = run_dir
+    def __init__(
+        self,
+        config: str | None = None,
+        /,
+        *,
+        run_dir: RunDir | None = None,
+        log: str | None = None,
+        **overrides: Any,
+    ) -> None:
+        self._launch = (config, run_dir, log, overrides)
 
     @abc.abstractmethod
     def main(self) -> int | None:
         """The run's work; results go under `self.run_dir`. Returns this process's exit status."""
+
+    def run(self) -> NoReturn:
+        name = type(self).__qualname__
+        schema = _config_class(name, "`config`", get_type_hints(type(self)).get("config"))
+
+        def main(cfg: Any, run_dir: str) -> int | None:
+            self.config, self.run_dir = cfg, run_dir
+            return self.main()
+
+        _launch(_Entrypoint(main, schema, True), *self._launch)
 
 
 # A config class is a @dataclass subclassing Config: what an entry point's annotation must name.
@@ -265,7 +287,7 @@ class _Entrypoint:
 
     A function IS its config — one annotated argument, so the entry point names the routine and the
     schema comes with it — plus an OPTIONAL second argument, `run_dir: str`, for a routine that writes
-    into the folder (which is most of them). A `Run` subclass is the same promise made by its `config`
+    into the folder (which is most of them). A `Run` makes the same promise with its `config`
     annotation, and always takes the folder.
     """
 
@@ -274,11 +296,7 @@ class _Entrypoint:
     wants_run_dir: bool
 
     @classmethod
-    def of(cls, function: Callable[..., int | None] | type[Run]) -> _Entrypoint:
-        if isinstance(function, type) and issubclass(function, Run):
-            run_class = function
-            schema = _config_class(run_class.__qualname__, "`config`", get_type_hints(run_class).get("config"))
-            return cls(lambda cfg, run_dir: run_class(cfg, run_dir).main(), schema, True)
+    def of(cls, function: Callable[..., int | None]) -> _Entrypoint:
         if not callable(function):
             raise TypeError(f"run() takes a function of one config argument, not {type(function).__name__}")
         name = getattr(function, "__qualname__", repr(function))
@@ -413,7 +431,7 @@ def _usage(extra: str = "") -> NoReturn:
 # `run` never returns — it exits with the function's status — so a script's __main__ spells neither
 # sys.argv nor SystemExit.
 def run(
-    function: Callable[..., int | None] | type[Run],
+    function: Callable[..., int | None],
     config: str | None = None,
     /,
     *,
@@ -421,7 +439,13 @@ def run(
     log: str | None = None,
     **overrides: Any,
 ) -> NoReturn:
-    entry = _Entrypoint.of(function)
+    _launch(_Entrypoint.of(function), config, run_dir, log, overrides)
+
+
+# The launch itself, shared by `run` and `Run.run`: load the config, open the folder, call, exit.
+def _launch(
+    entry: _Entrypoint, config: str | None, run_dir: RunDir | None, log: str | None, overrides: dict[str, Any]
+) -> NoReturn:
     launch = _Launch.parse(list(sys.argv[1:]))
     if config is not None:
         launch = dataclasses.replace(launch, specs=[config])
