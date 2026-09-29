@@ -5,7 +5,7 @@
 #     def main(cfg: MyConfig, run_dir: str) -> int:   # MyConfig: a dataclass of MISSING leaves and
 #         ...                                         # nested config classes; results go under run_dir
 #
-#     if __name__ == "__main__":                      # python main.py configs/my.yaml --run-dir runs/x
+#     if __name__ == "__main__":                      # python main.py config=configs/my.yaml home=runs/x
 #         run(main)
 #
 # Four rules:
@@ -16,8 +16,8 @@
 #   * a config FILE names the class it fills (`_ > <dotted.path>:`), and a hierarchical class takes
 #     a hierarchical file; every key it sets is a field of that class (structured.py);
 #   * every leaf is required — nothing is silently defaulted, "off" is spelled `null` (structured.py);
-#   * where a run WRITES is not part of its config: `run_dir` and `log` are the launcher's, from the
-#     command line or the script (runs.py).
+#   * where a run WRITES is not part of its config: `config=` and `home=` are the launcher's, from the
+#     command line or the script, and the log is always `run.log` in the run folder (runs.py).
 #
 # See config.py for the YAML loader, the `_default:` composition that works at any depth, and the
 # ${now:...} / ${from_yaml:...} resolvers; and paths.py for the project-root rule relative paths

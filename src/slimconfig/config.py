@@ -227,11 +227,6 @@ class _Composer:
         self.keys: list[Key] = []
         self.visiting: tuple[Path, ...] = ()  # the `_default:` chain currently open, outermost first
 
-    @classmethod
-    def compose(cls, path: Path, node: tuple[str, ...]) -> Composed:
-        self = cls()
-        return Composed(self.file(path, node), tuple(self.claims), tuple(self.keys))
-
     # One config FILE, composed at `node`. Every file must open by naming the class it fills: that is
     # the one thing a reader (and load_config) needs in order to know what the keys below it mean. The
     # declarations are read off the keys and the keys cleaned of them BEFORE anything is merged, so a
@@ -334,7 +329,9 @@ class _Composer:
 # under an `optim:` block — every claim it makes is reported relative to that, so load_config can check
 # it against the right class. Keys and not one dotted string, because a table key may contain a dot.
 def compose(path: str | Path, node: tuple[str, ...] = ()) -> Composed:
-    return _Composer.compose(Path(path).resolve(), node)
+    walk = _Composer()
+    config = walk.file(Path(path).resolve(), node)
+    return Composed(config, tuple(walk.claims), tuple(walk.keys))
 
 
 def load_mapping_yaml(path: str) -> DictConfig:

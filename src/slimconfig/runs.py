@@ -7,19 +7,16 @@
 #                  second folder of its own (one cell of a sweep, say).
 #   * tee_stdout — the log on its own.
 #
-# WHERE A RUN WRITES IS NOT PART OF ITS CONFIG. A config says what to compute; the folder and the log say
-# where this particular launch puts it, which is a property of the invocation — the same config re-run
-# into a scratch directory is the same config. So `run_dir` and `log` are arguments of the launcher, from
-# the command line (`--run-dir` / `--log`) or from the script (`run(main, run_dir=...)`), and no config
-# class declares them. A run dir that is a FUNCTION of the config — an identity-addressed output tree —
-# is passed as a function, which is one rule in code instead of the same interpolation copied into every
-# config file that lands there. Both are recorded in the folder's metadata.json either way.
+# WHERE A RUN WRITES IS NOT PART OF ITS CONFIG. A config says what to compute; the folder says where this
+# particular launch puts it, which is a property of the invocation — the same config re-run into a
+# scratch directory is the same config. So a launch is spelled in one grammar, the same on the command
+# line and in the script:
 #
-# Three objects hold the three things a launch is made of, so `run` itself reads as the four steps it
-# takes and each rule has a name:
-#   * Entrypoint — the routine being launched: its config class, and whether it also wants the folder.
-#   * Launch     — what the command line said: the config specs, and where this run writes.
-#   * RunFolder  — the folder itself: the snapshot in it, and the log tee'd into it.
+#     python train.py config=configs/train.yaml home=runs/exp1 -- optim.lr=1e-4
+#
+# `config=` names the file to load (repeated, merged left to right), `home=` the folder this run owns,
+# and every `key=value` after `--` is an override of the config. The log is always `run.log` inside
+# the folder. All of it is recorded in the folder's metadata.json.
 
 from __future__ import annotations
 
@@ -44,16 +41,12 @@ from .structured import Spec, load_config
 
 __all__ = ["Run", "run", "start_run", "tee_stdout"]
 
-# Where a run writes, spelled on the command line. Both take `--flag value` or `--flag=value`.
-RUN_DIR_FLAG = "--run-dir"
-LOG_FLAG = "--log"
-NO_LOG_FLAG = "--no-log"
-
-# A run dir given to `run`: the path itself, or a function returning it. The function takes the loaded
-# config, and OPTIONALLY the config file this launch was given as a second argument — which is how a
-# script says "the folder is named after the config that produced it", the one naming rule that keeps a
-# result and the file that asked for it findable from each other.
-type RunDir = str | Callable[..., str]
+# The launcher's keys on the command line, and the log every run folder holds.
+CONFIG_KEY = "config"
+HOME_KEY = "home"
+OVERRIDES_SEPARATOR = "--"
+HELP_FLAGS = ("-h", "--help")
+LOG = "run.log"
 
 
 # ── the snapshot ─────────────────────────────────────────────────────────────
@@ -88,7 +81,7 @@ def _as_dictconfig(config: Any) -> DictConfig:
 
 
 # The declarations that make a snapshot a config file like any other, so a run can be repeated from its
-# own folder (`python train.py <run_dir>/config.yaml --run-dir <somewhere>`). Every mapping that fills a
+# own folder (`python train.py config=<home>/config.yaml home=<somewhere>`). Every mapping that fills a
 # config class gets one, exactly as a hand-written config must — a snapshot missing them would not
 # reload, which is the strongest possible check that the rule is the same on both sides. A block names
 # its class on its own key; a table names `dict[<key>, <class>]`, once, for all of its entries; an entry
@@ -133,7 +126,7 @@ def _snapshot(config: Any) -> str:
 
 # Open the run's folder and record what produced it. Writes two files:
 #   config.yaml   — the fully-resolved config, re-runnable as-is
-#                   (`python run.py <run_dir>/config.yaml --run-dir <somewhere>`)
+#                   (`python run.py config=<run_dir>/config.yaml home=<somewhere>`)
 #   metadata.json — argv / cwd / run dir / git commit / start time / host
 # Everything the run produces goes in this same folder, so a result is never separated from its config.
 # The folder itself must be creatable (the run needs somewhere to write); the snapshot is best-effort —
@@ -142,7 +135,7 @@ def start_run(run_dir: str, config: Any) -> str:
     os.makedirs(run_dir, exist_ok=True)
     try:
         # Render BOTH payloads before touching a file: re-running a run from its own snapshot
-        # (`python run.py <run_dir>/config.yaml`) passes the very file we are about to overwrite, and
+        # (`python run.py config=<run_dir>/config.yaml`) passes the very file we are about to overwrite, and
         # opening it "w" first would truncate it out from under the read.
         snapshot = _snapshot(config)
         meta = json.dumps({
@@ -209,66 +202,37 @@ def tee_stdout(path: str, banner: str | None = None) -> Iterator[str]:
 # ── the launch ───────────────────────────────────────────────────────────────
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class _RunFolder:
-    """The folder one run owns: where it is, and what it logs to (None for no log)."""
-
-    path: str
-    log: str | None
-
-    # Snapshot `cfg` into the folder and tee stdout to the log inside it, for the length of the block.
-    @contextlib.contextmanager
-    def open(self, cfg: Any) -> Iterator[str]:
-        start_run(self.path, cfg)
-        if not self.log:
-            yield self.path
-            return
-        stamp = datetime.now(UTC).isoformat(timespec="seconds")
-        banner = f"\n═══ {stamp} · {' '.join(sys.argv)} ═══"
-        with tee_stdout(os.path.join(self.path, self.log), banner=banner):
-            yield self.path
-
-
 class Run(abc.ABC):
     """A run as a class: the config it runs on, the folder it runs into, and `main`, the work it does.
 
     The class form of a `run` function, for a routine whose work is several methods sharing state. A
     subclass annotates `config` with its config class — the same promise a function's first argument
     makes — and implements `main`. An instance is built with what `run` takes besides the function
-    (the config file, `run_dir=`, `log=`, overrides), and `.run()` launches it:
+    (`config=`, `home=`, overrides), and `.run()` launches it:
 
-        Train(log="train.log").run()
+        Train().run()
 
-    `.run()` loads `config`, opens the folder as `run_dir`, calls `main`, and exits with its status.
+    `.run()` loads `config`, opens `home` as `run_dir`, calls `main`, and exits with its status.
     """
 
     config: Config
     run_dir: str
 
-    def __init__(
-        self,
-        config: str | None = None,
-        /,
-        *,
-        run_dir: RunDir | None = None,
-        log: str | None = None,
-        **overrides: Any,
-    ) -> None:
-        self._launch = (config, run_dir, log, overrides)
+    def __init__(self, *, config: str | None = None, home: str | None = None, **overrides: Any) -> None:
+        self._launch = (config, home, overrides)
 
     @abc.abstractmethod
     def main(self) -> int | None:
         """The run's work; results go under `self.run_dir`. Returns this process's exit status."""
 
     def run(self) -> NoReturn:
-        name = type(self).__qualname__
-        schema = _config_class(name, "`config`", get_type_hints(type(self)).get("config"))
+        schema = _config_class(type(self).__qualname__, "`config`", get_type_hints(type(self)).get("config"))
 
         def main(cfg: Any, run_dir: str) -> int | None:
             self.config, self.run_dir = cfg, run_dir
             return self.main()
 
-        _launch(_Entrypoint(main, schema, True), *self._launch)
+        _launch(schema, main, *self._launch)
 
 
 # A config class is a @dataclass subclassing Config: what an entry point's annotation must name.
@@ -281,122 +245,64 @@ def _config_class(owner: str, where: str, schema: Any) -> type:
     return schema
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class _Entrypoint:
-    """The routine `run` was given, and what its signature says it wants.
-
-    A function IS its config — one annotated argument, so the entry point names the routine and the
-    schema comes with it — plus an OPTIONAL second argument, `run_dir: str`, for a routine that writes
-    into the folder (which is most of them). A `Run` makes the same promise with its `config`
-    annotation, and always takes the folder.
-    """
-
-    function: Callable[..., int | None]
-    schema: type
-    wants_run_dir: bool
-
-    @classmethod
-    def of(cls, function: Callable[..., int | None]) -> _Entrypoint:
-        if not callable(function):
-            raise TypeError(f"run() takes a function of one config argument, not {type(function).__name__}")
-        name = getattr(function, "__qualname__", repr(function))
-        params = _positional(function, keyword_only=True)
-        if not 1 <= len(params) <= 2:
-            raise TypeError(
-                f"{name} must take its config, and optionally the run folder — one or two arguments, "
-                f"not {len(params)}"
-            )
-        hints = get_type_hints(function)
-        schema = _config_class(name, f"argument `{params[0].name}`", hints.get(params[0].name))
-        if len(params) == 2 and hints.get(params[1].name) is not str:
-            raise TypeError(
-                f"{name}'s second argument `{params[1].name}` is the run folder and must be annotated "
-                f"`str`, got {hints.get(params[1].name)!r}"
-            )
-        return cls(function, schema, len(params) == 2)
-
-    def __call__(self, cfg: Any, run_dir: str) -> int | None:
-        return self.function(cfg, run_dir) if self.wants_run_dir else self.function(cfg)
+# The routine `run` was given, as its config class and a call taking (config, run folder). A function IS
+# its config — one annotated argument, so the schema comes with the routine — plus an OPTIONAL second
+# argument, `run_dir: str`, for a routine that writes into the folder (which is most of them).
+def _entrypoint(function: Callable[..., int | None]) -> tuple[type, Callable[[Any, str], int | None]]:
+    if not callable(function):
+        raise TypeError(f"run() takes a function of one config argument, not {type(function).__name__}")
+    name = getattr(function, "__qualname__", repr(function))
+    kinds = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    params = [p for p in inspect.signature(function).parameters.values() if p.kind in kinds]
+    if not 1 <= len(params) <= 2:
+        raise TypeError(f"{name} must take its config, and optionally the run folder — one or two arguments, not {len(params)}")
+    hints = get_type_hints(function)
+    schema = _config_class(name, f"argument `{params[0].name}`", hints.get(params[0].name))
+    if len(params) == 1:
+        return schema, lambda cfg, run_dir: function(cfg)
+    if hints.get(params[1].name) is not str:
+        raise TypeError(
+            f"{name}'s second argument `{params[1].name}` is the run folder and must be annotated "
+            f"`str`, got {hints.get(params[1].name)!r}"
+        )
+    return schema, function
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class _Launch:
-    """What the command line said: the config specs, and whichever of the run dir / log it set.
-
-    `--no-log` is how a launch says "no log file" over a script that asked for one — every rank of a
-    distributed launch would otherwise append to one path.
-    """
-
-    specs: list[str]
-    run_dir: str | None
-    log: str | None
-    no_log: bool
-
-    # Pull `--run-dir` / `--log` / `--no-log` out of an argv tail; what is left is the config specs.
-    @classmethod
-    def parse(cls, argv: list[str]) -> _Launch:
-        specs: list[str] = []
-        taken: dict[str, str] = {}
-        no_log = False
-        i = 0
-        while i < len(argv):
-            arg = argv[i]
-            i += 1
-            if arg == NO_LOG_FLAG:
-                no_log = True
-                continue
-            flag = next((f for f in (RUN_DIR_FLAG, LOG_FLAG) if arg == f or arg.startswith(f + "=")), None)
-            if flag is None:
-                specs.append(arg)
-                continue
-            if arg != flag:
-                taken[flag] = arg[len(flag) + 1 :]
-                continue
-            if i >= len(argv):
-                raise SystemExit(f"{flag} needs a value")
-            taken[flag], i = argv[i], i + 1
-        return cls(specs, taken.get(RUN_DIR_FLAG), taken.get(LOG_FLAG), no_log)
-
-    # The folder this run owns, and the log inside it. The command line wins over what the script asked
-    # for, in both cases. A run dir the script gave as a FUNCTION is called here — with the loaded
-    # config, and with the config file this launch was given if it takes a second argument.
-    def folder(self, script_run_dir: RunDir | None, script_log: str | None, cfg: Any) -> _RunFolder:
-        where: RunDir | None = self.run_dir if self.run_dir is not None else script_run_dir
-        if callable(where):
-            wants_file = len(_positional(where)) > 1
-            where = where(cfg, self.primary_config()) if wants_file else where(cfg)
-        if not where:
-            _usage(
-                "this run has nowhere to write: pass `--run-dir PATH`, or give the script a run dir "
-                "(`run(fn, run_dir=...)`) — every run owns a folder holding its config, its log and its results"
-            )
-        log = None if self.no_log else (self.log if self.log is not None else script_log)
-        return _RunFolder(where, log)
-
-    # The config FILE this launch was given — the first spec that names one. "" when the config came
-    # from overrides alone, so a run-dir function that names a folder after it can say so itself.
-    # FIRST, not last: with several files the first is the one the reader typed as "what this run is",
-    # the rest being what it was combined with. A launch where that is not true should pass `--run-dir`.
-    def primary_config(self) -> str:
-        return next((s for s in self.specs if os.path.isfile(s)), "")
+# What the command line said: the `config=` files, the `home=` folder, and the overrides. Before `--` are
+# the launcher's own `config=` / `home=`; after it, every `key=value` is an override of the config — so a
+# config field may be called `config` or `home` too. `-h` / `--help` before `--` prints the grammar.
+def _parse(argv: list[str]) -> tuple[list[str], str | None, list[str]]:
+    split = argv.index(OVERRIDES_SEPARATOR) if OVERRIDES_SEPARATOR in argv else len(argv)
+    configs: list[str] = []
+    home: str | None = None
+    for arg in argv[:split]:
+        if arg in HELP_FLAGS:
+            print(_usage_line())
+            raise SystemExit(0)
+        key, _, value = arg.partition("=")
+        if key == CONFIG_KEY:
+            configs.append(value)
+        elif key == HOME_KEY:
+            home = value
+        else:
+            _usage(f"{arg!r} is not `{CONFIG_KEY}=` or `{HOME_KEY}=`: overrides go after `{OVERRIDES_SEPARATOR}`")
+    overrides = argv[split + 1 :]
+    for arg in overrides:
+        if "=" not in arg:
+            _usage(f"override {arg!r} is not key=value")
+    return configs, home, overrides
 
 
-# The positional parameters of a function — plus the keyword-only ones where those count too (a config
-# argument may be spelled either way; a run-dir function's cannot, since `run` passes them positionally).
-def _positional(function: Callable[..., Any], keyword_only: bool = False) -> list[inspect.Parameter]:
-    kinds = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    if keyword_only:
-        kinds += (inspect.Parameter.KEYWORD_ONLY,)
-    return [p for p in inspect.signature(function).parameters.values() if p.kind in kinds]
+def _usage_line() -> str:
+    script = os.path.basename(sys.argv[0]) or "run.py"
+    return (
+        f"usage: {script} {CONFIG_KEY}=<config.yaml> [{CONFIG_KEY}=<more.yaml> ...] {HOME_KEY}=<run folder> "
+        f"[{OVERRIDES_SEPARATOR} key=value ...]"
+    )
 
 
 def _usage(extra: str = "") -> NoReturn:
-    script = os.path.basename(sys.argv[0]) or "run.py"
-    raise SystemExit(
-        (extra + "\n" if extra else "")
-        + f"usage: {script} <config.yaml> [more.yaml ...] [key=value ...] "
-        + f"[{RUN_DIR_FLAG} PATH] [{LOG_FLAG} NAME | {NO_LOG_FLAG}]"
-    )
+    raise SystemExit((extra + "\n" if extra else "") + _usage_line())
 
 
 # Run this process as one run:
@@ -404,65 +310,75 @@ def _usage(extra: str = "") -> NoReturn:
 #              and optionally the run folder (a second argument annotated `str`), and returns this
 #              process's exit status (None -> 0).
 #   config   — the YAML file to load that class from. Omitted, it comes off the command line
-#              (`<config.yaml> [more.yaml ...] [key=value ...]`), which is how a stepN script is normally
-#              launched. SEVERAL files may be named, merged left to right — that is where independent
-#              fragments are combined, since a file inherits only one (`_default:` in config.py). The
-#              difference matters: a chain is a property of the files and lives in them, a combination is
-#              a property of this launch and shows up in its argv (and so in its metadata.json).
-#              NONE may be named either: a schema whose every field has a default is already a config,
-#              so a run with nothing to choose is `python step.py`, and `key=value` still wins over it.
-#   run_dir  — the folder this run owns: a path, or a function returning one — of the loaded config, and
-#              of the config file itself if it takes a second argument (`lambda cfg, path: ...`).
-#              `--run-dir` on the command line wins over it; one of the two must say.
-#   log      — the log file inside that folder, None for no log. `--log` / `--no-log` win over it.
-# Keyword arguments are `key=value` overrides applied on top, the same ones the command line takes:
-# `run(train, "configs/train.yaml", **{"optim.lr": 1e-4})`.
+#              (`config=<config.yaml>`), which is how a stepN script is normally launched. The command
+#              line wins over it. SEVERAL files may be named there (`config=a.yaml config=b.yaml`), merged
+#              left to right — that is where independent fragments are combined, since a file inherits
+#              only one (`_default:` in config.py). The difference matters: a chain is a property of the
+#              files and lives in them, a combination is a property of this launch and shows up in its
+#              argv (and so in its metadata.json). NONE may be named either: a schema whose every field
+#              has a default is already a config, and `key=value` still wins over it.
+#   home     — the folder this run owns. Omitted, it comes off the command line (`home=<folder>`), which
+#              wins over it; one of the two must say.
+# Keyword arguments are `key=value` overrides applied on top, the same ones the command line takes after `--`:
+# `run(train, config="configs/train.yaml", **{"optim.lr": 1e-4})`.
 #
 # The launcher loads the config strictly (every field required, every file naming the class it fills),
 # creates the run folder, drops the config snapshot and metadata.json in it, tees the function's stdout
-# to the log inside it, calls the function, and exits with its status.
+# to `run.log` inside it, calls the function, and exits with its status.
 #
 #     def train(cfg: TrainConfig, run_dir: str) -> int:
 #         ...                                     # write results under run_dir
 #
-#     if __name__ == "__main__":                  # python train.py configs/train.yaml optim.lr=1e-4 \
-#         run(train, log="train.log")             #     --run-dir runs/exp1
+#     if __name__ == "__main__":                  # python train.py config=configs/train.yaml \
+#         run(train)                              #     home=runs/exp1 -- optim.lr=1e-4
 #
 # `run` never returns — it exits with the function's status — so a script's __main__ spells neither
 # sys.argv nor SystemExit.
 def run(
     function: Callable[..., int | None],
-    config: str | None = None,
     /,
     *,
-    run_dir: RunDir | None = None,
-    log: str | None = None,
+    config: str | None = None,
+    home: str | None = None,
     **overrides: Any,
 ) -> NoReturn:
-    _launch(_Entrypoint.of(function), config, run_dir, log, overrides)
+    _launch(*_entrypoint(function), config, home, overrides)
 
 
 # The launch itself, shared by `run` and `Run.run`: load the config, open the folder, call, exit.
 def _launch(
-    entry: _Entrypoint, config: str | None, run_dir: RunDir | None, log: str | None, overrides: dict[str, Any]
+    schema: type,
+    call: Callable[[Any, str], int | None],
+    config: str | None,
+    home: str | None,
+    overrides: dict[str, Any],
 ) -> NoReturn:
-    launch = _Launch.parse(list(sys.argv[1:]))
-    if config is not None:
-        launch = dataclasses.replace(launch, specs=[config])
-    specs = cast(list[Spec], [*launch.specs, *(f"{key}={value}" for key, value in overrides.items())])
+    configs, cli_home, cli_overrides = _parse(sys.argv[1:])
+    if not configs and config is not None:
+        configs = [config]
+    specs = cast(list[Spec], [*configs, *cli_overrides, *(f"{key}={value}" for key, value in overrides.items())])
 
     # Naming nothing is a run of the schema's own defaults, which is a whole config when every field
-    # has one — a step with nothing left to choose is then launched by naming the script, and the
-    # snapshot in its run folder still spells every field out. A schema that is not complete on its
-    # own answers by naming the field it is short of, which is what a reader of a bare launch needs;
+    # has one — a step with nothing left to choose is then launched by naming the script and its home,
+    # and the snapshot in its run folder still spells every field out. A schema that is not complete on
+    # its own answers by naming the field it is short of, which is what a reader of a bare launch needs;
     # the usage line goes under it to say where such a field is filled in.
     try:
-        cfg = load_config(entry.schema, specs)
+        cfg = load_config(schema, specs)
     except ValueError as incomplete:
         if specs:
             raise
         _usage(str(incomplete))
-    folder = launch.folder(run_dir, log, cfg)
-    with folder.open(cfg):
-        status = entry(cfg, folder.path)
+    where = cli_home or home
+    if not where:
+        _usage(
+            f"this run has nowhere to write: pass `{HOME_KEY}=PATH` — every run owns a folder holding "
+            "its config, its log and its results"
+        )
+
+    # The folder: the snapshot in it, and stdout tee'd to its `run.log` for the length of the call.
+    start_run(where, cfg)
+    banner = f"\n═══ {datetime.now(UTC).isoformat(timespec='seconds')} · {' '.join(sys.argv)} ═══"
+    with tee_stdout(os.path.join(where, LOG), banner=banner):
+        status = call(cfg, where)
     raise SystemExit(status)

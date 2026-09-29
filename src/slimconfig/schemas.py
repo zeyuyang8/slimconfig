@@ -199,7 +199,7 @@ def key_name(key: type) -> str:
 # declared, and a reader can open the name to see which keys there are.
 def _resolve_key(dotted: str, spelled: str) -> type:
     obj = _import_dotted(dotted)
-    if isinstance(obj, type) and issubclass(obj, enum.Enum):
+    if _is_enum(obj):
         return obj
     raise ValueError(
         f"`{spelled}` does not say what the keys are: a table is keyed by an Enum named in full, as its "

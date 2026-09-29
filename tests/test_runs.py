@@ -6,13 +6,14 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import fixtures
 import pytest
 from omegaconf import OmegaConf
 
-from slimconfig import Run, load_config, run, start_run, tee_stdout
+from slimconfig import Config, Run, load_config, run, start_run, tee_stdout
 
 FULL = """
 model: llama
@@ -125,12 +126,12 @@ def test_tee_stdout_is_undone_after_an_exception(tmp_path, capsys):
 
 
 # `run` is a process boundary: it exits with the status the function returned. Every test below launches
-# it the way a shell would — the specs and the flags on the command line — and reads that status back off
-# the SystemExit, which is what the shell would see.
-def launch(monkeypatch, argv, function, *args, **kwargs) -> object:
+# it the way a shell would — `config=` / `home=` / overrides on the command line — and reads that status
+# back off the SystemExit, which is what the shell would see.
+def launch(monkeypatch, argv, function, **kwargs) -> object:
     monkeypatch.setattr("sys.argv", ["train.py", *argv])
     with pytest.raises(SystemExit) as exit_info:
-        run(function, *args, **kwargs)
+        run(function, **kwargs)
     return exit_info.value.code
 
 
@@ -140,42 +141,66 @@ def test_run_loads_the_config_and_opens_the_folder(tmp_path, monkeypatch, write)
         (tmp_path / "run" / "result.txt").write_text(cfg.model)  # results land in the run folder
         return 0
 
-    argv = [write(tmp_path / "a.yaml", FULL), "--run-dir", str(tmp_path / "run")]
-    assert launch(monkeypatch, argv, train, log="train.log") == 0
+    argv = [f"config={write(tmp_path / 'a.yaml', FULL)}", f"home={tmp_path / 'run'}"]
+    assert launch(monkeypatch, argv, train) == 0
     assert (tmp_path / "run" / "config.yaml").is_file()
     assert (tmp_path / "run" / "metadata.json").is_file()
     assert (tmp_path / "run" / "result.txt").read_text() == "llama"
-    assert "training llama" in (tmp_path / "run" / "train.log").read_text()
+    assert "training llama" in (tmp_path / "run" / "run.log").read_text()  # the log is always run.log
 
 
 def test_run_exits_zero_when_the_function_returns_nothing(tmp_path, monkeypatch, write):
     def train(cfg: fixtures.TrainConfig) -> None:
         return None
 
-    argv = [write(tmp_path / "a.yaml", FULL), f"--run-dir={tmp_path / 'run'}"]
+    argv = [f"config={write(tmp_path / 'a.yaml', FULL)}", f"home={tmp_path / 'run'}"]
     assert launch(monkeypatch, argv, train) is None
 
 
-def test_run_takes_its_specs_from_the_command_line(tmp_path, monkeypatch, write):
+def test_run_takes_overrides_from_the_command_line(tmp_path, monkeypatch, write):
     def train(cfg: fixtures.TrainConfig) -> int:
         return 0 if cfg.model == "qwen" else 1
 
-    argv = [write(tmp_path / "a.yaml", FULL), f"--run-dir={tmp_path / 'run'}", "model=qwen"]
+    argv = [f"config={write(tmp_path / 'a.yaml', FULL)}", f"home={tmp_path / 'run'}", "--", "model=qwen"]
     assert launch(monkeypatch, argv, train) == 0
 
 
-def test_run_takes_a_config_path_and_overrides_from_the_caller(tmp_path, monkeypatch, write):
+def test_run_merges_several_config_files_left_to_right(tmp_path, monkeypatch, write):
+    def train(cfg: fixtures.TrainConfig) -> int:
+        return 0 if cfg.model == "qwen" else 1
+
+    argv = [
+        f"config={write(tmp_path / 'a.yaml', FULL)}",
+        f"config={write(tmp_path / 'b.yaml', 'model: qwen')}",
+        f"home={tmp_path / 'run'}",
+    ]
+    assert launch(monkeypatch, argv, train) == 0
+
+
+def test_run_takes_the_config_home_and_overrides_from_the_caller(tmp_path, monkeypatch, write):
     def train(cfg: fixtures.TrainConfig) -> int:
         return 0 if (cfg.model, cfg.optim.lr) == ("qwen", 0.5) else 1
 
-    path = write(tmp_path / "a.yaml", FULL)
-    # The command line is ignored when the caller names the config itself.
     code = launch(
-        monkeypatch, ["ignored.yaml"], train, path,
-        run_dir=str(tmp_path / "run"), **{"model": "qwen", "optim.lr": 0.5},
+        monkeypatch, [], train,
+        config=write(tmp_path / "a.yaml", FULL), home=str(tmp_path / "run"),
+        **{"model": "qwen", "optim.lr": 0.5},
     )
     assert code == 0
     assert (tmp_path / "run" / "config.yaml").is_file()
+
+
+def test_the_command_line_wins_over_the_script(tmp_path, monkeypatch, write):
+    seen = {}
+
+    def train(cfg: fixtures.TrainConfig, run_dir: str) -> None:
+        seen["model"], seen["dir"] = cfg.model, run_dir
+
+    script = write(tmp_path / "script.yaml", FULL)
+    cli = write(tmp_path / "cli.yaml", FULL.replace("llama", "qwen"))
+    argv = [f"config={cli}", f"home={tmp_path / 'cli'}"]
+    launch(monkeypatch, argv, train, config=script, home=str(tmp_path / "script"))
+    assert seen == {"model": "qwen", "dir": str(tmp_path / "cli")}
 
 
 def test_run_with_no_config_runs_on_the_schemas_own_defaults(tmp_path, monkeypatch):
@@ -184,7 +209,7 @@ def test_run_with_no_config_runs_on_the_schemas_own_defaults(tmp_path, monkeypat
 
     # Nothing named, so the class is the config — and `key=value` still wins over it. The snapshot is
     # written all the same: a run of the defaults is still answerable to a file that lists them.
-    code = launch(monkeypatch, ["steps=20"], train, run_dir=str(tmp_path / "run"))
+    code = launch(monkeypatch, [f"home={tmp_path / 'run'}", "--", "steps=20"], train)
     assert code == 0
     assert OmegaConf.load(tmp_path / "run" / "config.yaml").model == "llama"
 
@@ -195,7 +220,33 @@ def test_run_reports_usage_when_given_no_config_and_the_schema_is_not_complete(m
 
     message = str(launch(monkeypatch, [], train))
     assert "missing required field(s): model" in message  # what the run is short of, named
-    assert "usage: train.py <config.yaml>" in message  # and where such a field is filled in
+    assert "usage: train.py config=<config.yaml>" in message  # and where such a field is filled in
+
+
+def test_help_prints_the_grammar(monkeypatch, capsys):
+    def train(cfg: fixtures.TrainConfig) -> int:
+        raise AssertionError("must not run")
+
+    assert launch(monkeypatch, ["--help"], train) == 0
+    assert "usage: train.py config=<config.yaml>" in capsys.readouterr().out
+
+
+def test_only_config_and_home_come_before_the_separator(tmp_path, monkeypatch, write):
+    def train(cfg: fixtures.TrainConfig) -> int:
+        raise AssertionError("must not run")
+
+    path = write(tmp_path / "a.yaml", FULL)
+    for stray in (path, "model=qwen"):  # a bare file, or an override missing its `--`
+        message = str(launch(monkeypatch, [f"config={path}", f"home={tmp_path}", stray], train))
+        assert "is not `config=` or `home=`: overrides go after `--`" in message
+
+
+def test_an_override_that_is_not_key_value_is_an_error(tmp_path, monkeypatch, write):
+    def train(cfg: fixtures.TrainConfig) -> int:
+        raise AssertionError("must not run")
+
+    argv = [f"config={write(tmp_path / 'a.yaml', FULL)}", f"home={tmp_path}", "--", "qwen"]
+    assert "override 'qwen' is not key=value" in str(launch(monkeypatch, argv, train))
 
 
 # ── Run: the class form ──────────────────────────────────────────────────────
@@ -210,13 +261,14 @@ def test_a_run_instance_loads_its_config_and_calls_main(tmp_path, monkeypatch, w
             (Path(self.run_dir) / "result.txt").write_text(self.config.model)
             return 0
 
-    monkeypatch.setattr("sys.argv", ["train.py", write(tmp_path / "a.yaml", FULL), "--run-dir", str(tmp_path / "run")])
+    argv = [f"config={write(tmp_path / 'a.yaml', FULL)}", f"home={tmp_path / 'run'}"]
+    monkeypatch.setattr("sys.argv", ["train.py", *argv])
     with pytest.raises(SystemExit) as exit_info:
-        Train(log="train.log").run()
+        Train().run()
     assert exit_info.value.code == 0
     assert (tmp_path / "run" / "config.yaml").is_file()
     assert (tmp_path / "run" / "result.txt").read_text() == "llama"
-    assert "training llama" in (tmp_path / "run" / "train.log").read_text()
+    assert "training llama" in (tmp_path / "run" / "run.log").read_text()
 
 
 def test_a_run_must_annotate_its_config_class(monkeypatch):
@@ -231,74 +283,12 @@ def test_a_run_must_annotate_its_config_class(monkeypatch):
 # ── run: where it writes is the launcher's, not the config's ─────────────────
 
 
-def test_the_script_can_name_the_run_dir(tmp_path, monkeypatch, write):
-    seen = {}
-
-    def train(cfg: fixtures.TrainConfig, run_dir: str) -> None:
-        seen["dir"] = run_dir
-
-    launch(monkeypatch, [write(tmp_path / "a.yaml", FULL)], train, run_dir=str(tmp_path / "fixed"))
-    assert seen["dir"] == str(tmp_path / "fixed")
-
-
-def test_the_command_line_wins_over_the_script(tmp_path, monkeypatch, write):
-    seen = {}
-
-    def train(cfg: fixtures.TrainConfig, run_dir: str) -> None:
-        seen["dir"] = run_dir
-
-    argv = [write(tmp_path / "a.yaml", FULL), "--run-dir", str(tmp_path / "cli")]
-    launch(monkeypatch, argv, train, run_dir=str(tmp_path / "script"))
-    assert seen["dir"] == str(tmp_path / "cli")
-
-
-def test_the_run_dir_can_be_a_function_of_the_config(tmp_path, monkeypatch, write):
-    # An identity-addressed output tree is one rule in code, not the same interpolation in every file.
-    seen = {}
-
-    def train(cfg: fixtures.TrainConfig, run_dir: str) -> None:
-        seen["dir"] = run_dir
-
-    argv = [write(tmp_path / "a.yaml", FULL)]
-    launch(monkeypatch, argv, train, run_dir=lambda cfg: str(tmp_path / f"runs/{cfg.model}"))
-    assert seen["dir"] == str(tmp_path / "runs" / "llama")
-
-
-def test_the_run_dir_can_be_named_after_the_config_that_produced_it(tmp_path, monkeypatch, write):
-    # The commonest naming rule there is, and the launcher is the only one who knows which file it was.
-    seen = {}
-
-    def train(cfg: fixtures.TrainConfig, run_dir: str) -> None:
-        seen["dir"] = run_dir
-
-    def named(cfg, config: str) -> str:
-        return str(tmp_path / "runs" / Path(config).stem)
-
-    launch(monkeypatch, [write(tmp_path / "sweep_a.yaml", FULL)], train, run_dir=named)
-    assert seen["dir"] == str(tmp_path / "runs" / "sweep_a")
-
-
-def test_a_run_with_no_config_file_names_no_config(tmp_path, monkeypatch):
-    # Overrides alone are a legal launch, so the second argument has to have an empty answer.
-    seen = {}
-
-    def train(cfg: fixtures.TrainConfig, run_dir: str) -> None:
-        seen["dir"] = run_dir
-
-    def named(cfg, config: str) -> str:
-        return str(tmp_path / "runs" / (Path(config).stem or "unnamed"))
-
-    argv = ["model=llama", "tags=[]", "resume_from=null", "optim.lr=0.1",
-            "optim.warmup_steps=1", "data.path=x"]
-    launch(monkeypatch, argv, train, run_dir=named)
-    assert seen["dir"] == str(tmp_path / "runs" / "unnamed")
-
-
 def test_run_requires_a_folder_to_write_in(tmp_path, monkeypatch, write):
     def train(cfg: fixtures.TrainConfig) -> int:
         raise AssertionError("must not run")
 
-    assert "nowhere to write" in str(launch(monkeypatch, [write(tmp_path / "a.yaml", FULL)], train))
+    argv = [f"config={write(tmp_path / 'a.yaml', FULL)}"]
+    assert "nowhere to write: pass `home=PATH`" in str(launch(monkeypatch, argv, train))
 
 
 def test_a_config_may_not_smuggle_the_run_dir_back_in(tmp_path, monkeypatch, write):
@@ -306,60 +296,27 @@ def test_a_config_may_not_smuggle_the_run_dir_back_in(tmp_path, monkeypatch, wri
     def train(cfg: fixtures.TrainConfig) -> int:
         raise AssertionError("must not run")
 
-    argv = [write(tmp_path / "a.yaml", FULL + "run_dir: runs/sneaky\n"), f"--run-dir={tmp_path}"]
+    argv = [f"config={write(tmp_path / 'a.yaml', FULL + 'run_dir: runs/sneaky' + chr(10))}", f"home={tmp_path}"]
     monkeypatch.setattr("sys.argv", ["train.py", *argv])
     with pytest.raises(Exception, match="run_dir"):
         run(train)
 
 
-# ── run: the log ─────────────────────────────────────────────────────────────
+@dataclass
+class Homed(Config):
+    home: str = "x"
 
 
-def test_the_script_names_the_log_and_the_command_line_can_move_it(tmp_path, monkeypatch, write):
-    def loud(cfg: fixtures.TrainConfig) -> None:
-        print("named")
+def test_a_config_field_may_share_a_name_with_the_launchers_keys(tmp_path, monkeypatch):
+    # Before `--`, `home=` names the folder; after it, `home=` is the config's own field.
+    seen = {}
 
-    argv = [write(tmp_path / "a.yaml", FULL), f"--run-dir={tmp_path / 'run'}"]
-    launch(monkeypatch, argv, loud, log="train.log")
-    launch(monkeypatch, [*argv, "--log", "other.log"], loud, log="train.log")
-    assert "named" in (tmp_path / "run" / "train.log").read_text()
-    assert "named" in (tmp_path / "run" / "other.log").read_text()
+    def train(cfg: Homed, run_dir: str) -> None:
+        seen["home"], seen["dir"] = cfg.home, run_dir
 
+    launch(monkeypatch, [f"home={tmp_path / 'run'}", "--", "home=y"], train)
+    assert seen == {"home": "y", "dir": str(tmp_path / "run")}
 
-def test_no_log_turns_off_the_one_the_script_asked_for(tmp_path, monkeypatch, write):
-    # Every rank of a distributed launch would otherwise append to the one path.
-    def quiet(cfg: fixtures.TrainConfig) -> None:
-        print("quiet")
-
-    argv = [write(tmp_path / "a.yaml", FULL), f"--run-dir={tmp_path / 'run'}", "--no-log"]
-    launch(monkeypatch, argv, quiet, log="train.log")
-    assert list((tmp_path / "run").glob("*.log")) == []
-
-
-def test_a_script_that_asks_for_no_log_writes_none(tmp_path, monkeypatch, write):
-    def quiet(cfg: fixtures.TrainConfig) -> None:
-        print("quiet")
-
-    argv = [write(tmp_path / "a.yaml", FULL), f"--run-dir={tmp_path / 'run'}"]
-    launch(monkeypatch, argv, quiet)
-    assert list((tmp_path / "run").glob("*.log")) == []
-
-
-def test_the_log_may_sit_in_a_subfolder(tmp_path, monkeypatch, write):
-    def train(cfg: fixtures.TrainConfig) -> None:
-        print("nested")
-
-    argv = [write(tmp_path / "a.yaml", FULL), f"--run-dir={tmp_path / 'run'}"]
-    launch(monkeypatch, argv, train, log="logs/train.log")
-    assert "nested" in (tmp_path / "run" / "logs" / "train.log").read_text()
-
-
-def test_a_flag_with_no_value_is_an_error(tmp_path, monkeypatch, write):
-    def train(cfg: fixtures.TrainConfig) -> None:
-        raise AssertionError("must not run")
-
-    argv = [write(tmp_path / "a.yaml", FULL), "--run-dir"]
-    assert "--run-dir needs a value" in str(launch(monkeypatch, argv, train))
 
 
 # ── run: the function IS its config ──────────────────────────────────────────
@@ -373,7 +330,7 @@ def test_run_takes_the_schema_off_the_function_s_annotation(tmp_path, monkeypatc
         seen["lr"] = cfg.optim.lr
         return 0
 
-    argv = [write(tmp_path / "a.yaml", FULL), f"--run-dir={tmp_path / 'run'}"]
+    argv = [f"config={write(tmp_path / 'a.yaml', FULL)}", f"home={tmp_path / 'run'}"]
     assert launch(monkeypatch, argv, train) == 0
     assert seen == {"type": "TrainConfig", "lr": 0.0002}  # loaded, typed, not a mapping of strings
 
@@ -397,7 +354,7 @@ def main(cfg: SoloConfig, run_dir: str) -> int:
     return 0
 
 if __name__ == "__main__":
-    run(main, log="train.log")
+    run(main)
 '''
 
 
@@ -410,7 +367,7 @@ def test_a_one_file_script_can_name_its_own_classes(tmp_path):
         encoding="utf-8",
     )
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
-    argv = [sys.executable, "solo.py", "solo.yaml", "--run-dir", "run"]
+    argv = [sys.executable, "solo.py", "config=solo.yaml", "home=run"]
     done = subprocess.run(argv, cwd=tmp_path, env=env, capture_output=True, text=True, check=False)
     assert done.returncode == 0, done.stderr
     assert "llama 0.5" in done.stdout

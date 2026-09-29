@@ -322,8 +322,5 @@ def peek(args: list[Spec], key: str) -> Any:
 # imported. For an entry point that dispatches on the config it was handed. A file that fills a table
 # answers with its ENTRY class — the only class it names.
 def schema_of(path: str) -> type:
-    claims = compose(path).claims
-    root = next((c for c in claims if not c.node), None)
-    if root is None:  # compose() rejects a file that declares no class of its own, so this cannot happen
-        raise ValueError(f"config file {path!r} declares no class of its own")
+    root = next(c for c in compose(path).claims if not c.node)  # compose() requires the file's own `_ >` line
     return Schema.declared(root.schema).schema.cls
