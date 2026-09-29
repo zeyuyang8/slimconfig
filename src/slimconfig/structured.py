@@ -1,29 +1,12 @@
-# Typed, all-fields-required config loading — merge YAML onto a dataclass schema.
+# Typed, all-fields-required config loading: merge YAML onto a dataclass schema.
 #
-# A schema is a @dataclass whose every leaf defaults to omegaconf.MISSING, so a config must set each
-# field explicitly (nothing is silently filled in). load_config merges one or more specs (YAML files
-# and/or dotted key=value overrides) onto that schema and returns a fully populated instance.
-#
-# Four rules, enforced at load time:
-#   * every config FILE — and every nested BLOCK or TABLE in one that fills a config class — names that
-#     class on its own key (`<key> > <dotted.path>:`, `_ > <dotted.path>:` for the file itself, or
-#     `<key> > dict[<key type>, <dotted.path>]:` for a table, naming its entry class once for all of
-#     them), and it must be the class it is being merged onto, or a
-#     base of it. So a fragment cannot be mounted at a block it was not written for, pointing a script at
-#     the wrong config fails by class name instead of by an unknown key three levels down, and a
-#     hierarchical config says at every level what it is filling instead of only at the top;
-#   * every key a file sets is REGISTERED — a field of the class that file is filling, or, under a
-#     table or a mapping leaf, a member of the Enum that mapping is keyed by (a key type that is not an
-#     Enum is rejected at the `class` statement, so there is no third case). Checked file by file, so a
-#     typo is reported against the file that wrote it and not against the merged config, which has no
-#     memory of which of a `_default:` chain a key came from;
-#   * every leaf must end up set — an unset MISSING leaf raises (a nullable field that is "off" must
-#     still be present as null; an empty collection must be written out as []);
-#   * every value is the type its field promised, all the way down — OmegaConf checks a scalar but lets
-#     a `list[str]` hold a mapping, and a type hint that is not kept is worse than none.
-#
-# YAML files are read via slimconfig.config.compose, so any mapping in one — at any depth — may carry
-# `_default: <path>` to start from a shared file, and the file that names it wins on top.
+# load_config merges specs (YAML files, `key=value` overrides, mappings) onto a schema whose leaves
+# default to MISSING and returns a fully populated instance. Four rules, enforced at load time:
+#   * every file, block and table that fills a config class names it (`key > path:`, or `dict[K, C]`);
+#   * every key a file sets is a field of the class it fills (or an Enum member, under a mapping);
+#   * every leaf ends up set (a null must be written as null, an empty collection as []);
+#   * every value is the type its field declares, all the way down (OmegaConf only checks scalars).
+# Files are read via slimconfig.config.compose, so any mapping may carry `_default: <path>`.
 
 from __future__ import annotations
 
@@ -43,9 +26,7 @@ from .schemas import Schema, declaration_name, key_name, optional, value_error
 type Spec = str | Mapping[str, Any] | DictConfig
 
 
-# The config classes nested in a loaded `cfg`: one (prefix, schema, node) per group and per table ENTRY
-# actually there — the three-way branch (leaf / group / table) that every walk over a loaded config
-# would otherwise repeat. A field left unset, or set to null, has no node below it to walk.
+# Yield (prefix, schema, node) for each group and table entry present in `cfg`; unset/null are skipped.
 def _nested(cfg: DictConfig, schema: Schema, prefix: str) -> Iterator[tuple[str, Schema, DictConfig]]:
     for name, held in schema.fields.items():
         if held.cls is None or OmegaConf.is_missing(cfg, name) or cfg[name] is None:
@@ -57,12 +38,10 @@ def _nested(cfg: DictConfig, schema: Schema, prefix: str) -> Iterator[tuple[str,
                 yield f"{prefix}{name}.{key}.", Schema(held.cls), cfg[name][key]
 
 
-# Dotted paths of every leaf field still unset, walking the SCHEMA rather than the merged node: a
-# partial subtree is allowed to be unset, and only the schema says which subtrees those are. (Merging a
-# partial's node onto a complete one promotes the result's runtime type to the partial, so asking the
-# node "are you partial?" would answer yes for a config that is genuinely incomplete.)
+# Dotted paths of every unset leaf. Walks the schema, not the node: merging promotes a node's type to
+# the partial, so only the schema knows which subtrees are allowed to be unset.
 def _missing_fields(cfg: DictConfig, schema: Schema, prefix: str = "") -> list[str]:
-    if is_partial(schema.cls):  # a layer, not a run: saying nothing is what it is for
+    if is_partial(schema.cls):  # a partial may leave anything unset
         return []
     missing = [prefix + name for name in schema.fields if OmegaConf.is_missing(cfg, name)]
     for at, nested, node in _nested(cfg, schema, prefix):
@@ -70,10 +49,8 @@ def _missing_fields(cfg: DictConfig, schema: Schema, prefix: str = "") -> list[s
     return missing
 
 
-# Every value that is not the type its field promised, as `field.path[key] is not a str: {...}`. The
-# same walk as _missing_fields, asking the other question — and asking it of the LEAVES, since a group
-# and a table are what the schema itself is made of and OmegaConf has already held the config to them.
-# What is left is what OmegaConf does not check: the element type of a list, the value type of a dict.
+# Every leaf value not of its declared type, e.g. `field.path[key] is not a str: {...}`. Catches what
+# OmegaConf does not check: list element types and dict value types.
 def _wrong_values(cfg: DictConfig, schema: Schema, prefix: str = "") -> list[str]:
     hints = schema.hints
     wrong: list[str] = []
@@ -90,9 +67,8 @@ def _wrong_values(cfg: DictConfig, schema: Schema, prefix: str = "") -> list[str
     return wrong
 
 
-# Turn the merged node into schema instances. OmegaConf's own `to_object` cannot do this: it raises on
-# any MISSING leaf inside a structured node, even one a partial is entitled to leave unset. So the walk
-# is ours — an unset field is simply not passed, and the class's own MISSING default stands.
+# Build schema instances from the merged node. Not `OmegaConf.to_object`, which raises on the MISSING
+# leaves a partial may leave unset; here an unset field is just not passed.
 def _instantiate[T](node: DictConfig, schema: type[T]) -> T:
     kwargs: dict[str, Any] = {}
     for name, held in Schema(cast(type, schema)).fields.items():
@@ -108,8 +84,7 @@ def _instantiate[T](node: DictConfig, schema: type[T]) -> T:
     return schema(**kwargs)
 
 
-# One spec, composed on its own. A FILE goes through the whole YAML layer (its `_default:` chain, its
-# claims, its blocks); anything else is code and carries none of those.
+# Compose one spec: a file through the YAML layer, an override or mapping as-is.
 def _composed(spec: Spec) -> Composed:
     if isinstance(spec, Mapping | DictConfig):
         return Composed.of(spec)
@@ -120,29 +95,18 @@ def _composed(spec: Spec) -> Composed:
     raise FileNotFoundError(f"config spec {spec!r} is neither a file nor a key=value override")
 
 
-# Several specs merged into one, reported exactly as compose reports one file: a Composed is "a config,
-# every claim made anywhere in it, and every block written in it", and that is as true of five specs as
-# of one — a launch that names several files is one config assembled from all of them.
+# Merge several specs into one Composed, as if they were one file.
 def _merge(specs: list[Spec]) -> Composed:
     return reduce(Composed.merge, map(_composed, specs), Composed.empty())
 
 
-# Merge YAML files, dotted key=value overrides, and already-built mappings into one unstructured
-# config. A mapping spec lets a caller merge values it computed itself (one cell of a sweep matrix
-# resolved at runtime, say) under the same precedence rule — later specs win. A mapping is not a file
-# and declares no class; it is code, and code is already typed.
+# Merge specs into one unvalidated config; later specs win. A mapping spec declares no class.
 def merge_specs(specs: list[Spec]) -> DictConfig:
     return _merge(specs).config
 
 
-# Check every declaration against the class the config is actually being loaded as. A claim names
-# the class its block was written for; the block's real class comes from walking the schema. They agree
-# when the claim is that class or a base of it — a base states a subset of the fields, which is exactly
-# what a shared fragment does.
-#
-# A claim also says WHICH SHAPE it is: `dict[K, C]` for a table, a bare class for one of it. That half is
-# checked first and against the node alone, since a table and a group are the same mapping on the page
-# and a file that has them mixed up is not reporting a class mismatch — it thinks it is somewhere else.
+# Check each claimed class is the class at its node, or a base of it (a shared fragment). The shape
+# (table vs group) is checked first, since mixing them up is a wrong location, not a class mismatch.
 def _check_claims(schema: Schema, claims: tuple[Claim, ...]) -> None:
     for claim in claims:
         declared = Schema.declared(claim.schema)
@@ -169,7 +133,7 @@ def _table_at(schema: Schema, claim: Claim, where: str, key: type) -> Schema:
             f"config file {claim.source!r} says {where} is a table ({claim.schema}), but {where} of "
             f"{schema.name} is ONE {one}, not several keyed by anything: `{'.'.join(claim.node)} > {one}`"
         )
-    if key is not at.key:  # the same NAME from another module is another type, and would key nothing
+    if key is not at.key:  # identity: a same-named type from another module is different
         raise ValueError(
             f"config file {claim.source!r} says {where} is keyed by {key_name(key)}, but {schema.name}."
             f"{'.'.join(claim.node)} is keyed by {key_name(at.key)}: "
@@ -178,20 +142,8 @@ def _table_at(schema: Schema, claim: Claim, where: str, key: type) -> Schema:
     return Schema(at.cls)
 
 
-# Hold every BLOCK that fills a config class to the same rule the top of a file is held to: name the
-# class. A file already says what it fills; a nested block is a second config class in the same file and
-# is just as much written-against-a-class, so it says so too — which is what makes a hierarchical config
-# readable on its own and what makes moving or renaming a nested class break its configs loudly.
-#
-# A GROUP and a TABLE are both held to it, and this is the whole reason a table is spelled `dict[K, C]`:
-# on the page they are the same mapping, so a declaration that could not tell them apart would leave a
-# reader unable to say whether the keys below are the fields of one C or the names of several. A table
-# names its entry class ONCE, at the table, for however many entries it has; its ENTRIES name nothing,
-# since which class an entry has was fixed by the table and an entry repeating it adds a line that can
-# be wrong and never informative. An EMPTY table is exempt — `datasets: {}` is how a config says it has
-# none, and there is nothing under it to be read against a class. A leaf has no class to name at all,
-# and a claim on one is already an error (Schema.require). An unknown node is left alone: `_check_keys`
-# has already reported it as what it is.
+# Require every group and table block in a file to name its class; table entries name nothing. An empty
+# table is exempt: `datasets: {}` says there are none, and there is nothing under it to check.
 def _check_declared(schema: Schema, keys: tuple[Key, ...], claims: tuple[Claim, ...]) -> None:
     declared = {claim.node for claim in claims}
     filled = {k.node[:n] for k in keys for n in range(1, len(k.node))}
@@ -211,16 +163,8 @@ def _check_declared(schema: Schema, keys: tuple[Key, ...], claims: tuple[Claim, 
         )
 
 
-# Every key every spec set must be a field of the class it lands on. OmegaConf's struct check catches
-# an unknown key too, but only once everything is merged — and by then a key merged up a `_default:`
-# chain has no source left to name, which is exactly when a config is hardest to fix. Here each key is
-# still attached to the file (or the `key=value` override) that wrote it.
-#
-# Keys BELOW a leaf are not nodes of the schema at all: `metrics: {psnr: [...]}` on a
-# `dict[Metric, list[str]]` field writes a mapping the schema has nothing to say about beyond the leaf
-# itself, so the walk is only asked about a key whose whole path so far landed on groups and entries.
-# Those keys are not unchecked, though — the leaf's own key type is an Enum, and `_wrong_values` holds
-# the mapping to it.
+# Reject any key that is not a field of the class it lands on, before merging, so the error names the
+# file that wrote it. Keys inside a leaf's value are left to `_wrong_values`.
 def _check_keys(schema: Schema, keys: tuple[Key, ...]) -> None:
     for key in keys:
         walked = list(schema.walk(key.node))
@@ -236,12 +180,8 @@ def _check_keys(schema: Schema, keys: tuple[Key, ...]) -> None:
         )
 
 
-# A word an Enum names, as the MEMBER it names — the value first, since that is how a config file spells
-# an Enum. OmegaConf resolves a string to a member by NAME only, and a member's name is a python
-# identifier, so `flux.1-dev` places nowhere; inside a nested mapping (`dict[K, dict[K2, V]]`) no string
-# places at all. Resolving the member here is what makes ONE spelling work everywhere in a config — as a
-# key, as a scalar, in a list. A word no member names is left alone, for OmegaConf to reject with the
-# members it could have been.
+# Resolve a word to the Enum member it names, by value or name. OmegaConf resolves by name only (so
+# `flux.1-dev` fails, and nested mappings resolve nothing); an unknown word is left for OmegaConf to reject.
 def _member(word: Any, enum: type) -> Any:
     members = {name: member for member in cast(Any, enum) for name in (member.value, member.name)}
     return members.get(word, word) if isinstance(word, str) else word
@@ -253,8 +193,7 @@ def _by_member(mapping: Any, key: type) -> Any:
     return {_member(k, key): v for k, v in mapping.items()}
 
 
-# The same, everywhere in one LEAF its annotation says an Enum can be: the keys of a mapping, the values
-# of one, the elements of a list, the leaf itself.
+# Resolve Enum words everywhere in one leaf its annotation allows: the leaf, list items, dict keys and values.
 def _leaf_enums(value: Any, annotation: Any) -> Any:
     ann = optional(annotation)
     origin = get_origin(ann)
@@ -268,8 +207,7 @@ def _leaf_enums(value: Any, annotation: Any) -> Any:
     return {k: _leaf_enums(v, held) for k, v in _by_member(value, key).items()}
 
 
-# Every word in `node` that an Enum names, as that member — the whole config, walked against the schema,
-# before it is merged onto it.
+# Resolve Enum words across the whole config, walked against the schema, before merging onto it.
 def _enum_words(node: Any, schema: Schema) -> Any:
     if not isinstance(node, Mapping):
         return node
@@ -288,11 +226,8 @@ def _enum_words(node: Any, schema: Schema) -> Any:
     return out
 
 
-# Merge `specs` (YAML files and/or dotted key=value overrides) onto `schema`, in order (list a file
-# before the overrides that should win over it). Returns a fully-populated schema instance. Raises
-# TypeError if the schema itself cannot be filled from YAML, ValueError if a spec names the wrong class
-# or sets a key that is not a field, if any leaf is left unset, or if any value is not the type its
-# field declared, FileNotFoundError for a bad spec, and OmegaConf errors for a scalar of the wrong type.
+# Merge `specs` onto `schema` in order (later wins) and return a fully populated instance. Raises
+# TypeError for a bad schema, ValueError for a broken rule, FileNotFoundError for a bad spec.
 def load_config[T](schema: type[T], specs: list[Spec]) -> T:
     root = Schema(cast(type, schema))
     root.check()
@@ -311,16 +246,12 @@ def load_config[T](schema: type[T], specs: list[Spec]) -> T:
     return _instantiate(merged, schema)
 
 
-# Return `key` (dotted paths allowed) from the merged specs, or None — without validation, so a caller
-# can pick a schema from a value inside the config before loading it strictly (a schema chosen by
-# `method`, a cell named by a matrix). Accepts the same specs as load_config.
+# Return `key` from the merged specs (or None) without validation, e.g. to pick a schema before loading.
 def peek(args: list[Spec], key: str) -> Any:
     return OmegaConf.select(merge_specs(args), key, default=None)
 
 
-# The class a config file was written against, without loading it: the file's own `_ > <class>:` line,
-# imported. For an entry point that dispatches on the config it was handed. A file that fills a table
-# answers with its ENTRY class — the only class it names.
+# The class a config file names on its `_ >` line, without loading it (a table file gives its entry class).
 def schema_of(path: str) -> type:
     root = next(c for c in compose(path).claims if not c.node)  # compose() requires the file's own `_ >` line
     return Schema.declared(root.schema).schema.cls

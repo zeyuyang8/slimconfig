@@ -1,16 +1,8 @@
 # slimconfig.paths — anchor the relative paths a config names to the project root.
 #
-# A config says `corpus: data/corpus.parquet`, and that name has to mean the same file wherever the
-# process was launched from. resolve_path turns such a name into an absolute path under the project
-# root, discovered by walking up from the CWD:
-#   * the nearest ancestor holding a `.git` (a checkout root), else
-#   * the OUTERMOST ancestor holding a `pyproject.toml` (an exported/installed tree — the outermost
-#     one, because a workspace member has a pyproject.toml of its own and is not the root), else
-#   * the CWD.
-# Set SLIMCONFIG_PROJECT_ROOT to say it outright instead.
-#
-# Discovery starts at the CWD, never at slimconfig's own __file__: slimconfig lives in site-packages,
-# which is not the caller's project.
+# The root is SLIMCONFIG_PROJECT_ROOT if set, else found by walking up from the CWD: the nearest `.git`,
+# else the outermost `pyproject.toml` (a workspace member has its own), else the CWD.
+# Discovery starts at the CWD, not __file__: slimconfig lives in site-packages, not the caller's project.
 
 from __future__ import annotations
 

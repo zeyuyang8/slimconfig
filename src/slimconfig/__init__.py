@@ -9,19 +9,10 @@
 #         run(main)
 #
 # Four rules:
-#   * a config class is a @dataclass subclassing `Config`, holding LEAVES, NESTED CONFIG CLASSES and
-#     TABLES of one (`dict[K, C]`) — groups are composed as fields, not inherited as mixins, so a
-#     value's name says where it came from, and every type hint is one a YAML value can actually have,
-#     checked at the `class` statement (schemas.py);
-#   * a config FILE names the class it fills (`_ > <dotted.path>:`), and a hierarchical class takes
-#     a hierarchical file; every key it sets is a field of that class (structured.py);
-#   * every leaf is required — nothing is silently defaulted, "off" is spelled `null` (structured.py);
-#   * where a run WRITES is not part of its config: `config=` and `home=` are the launcher's, from the
-#     command line or the script, and the log is always `run.log` in the run folder (runs.py).
-#
-# See config.py for the YAML loader, the `_default:` composition that works at any depth, and the
-# ${now:...} / ${from_yaml:...} resolvers; and paths.py for the project-root rule relative paths
-# resolve against.
+#   * a config class is a @dataclass subclassing `Config` of leaves, nested classes and `dict[K, C]` tables.
+#   * a config file names its class (`_ > <dotted.path>:`) and sets only that class's fields.
+#   * every leaf is required; nothing is silently defaulted, and "off" is spelled `null`.
+#   * where a run writes is not config: `config=` and `home=` belong to the launcher; the log is `run.log`.
 
 from .config import compose, load_mapping_yaml, load_yaml
 from .partials import is_partial, partial_of, stated
@@ -32,10 +23,7 @@ from .structured import Spec, load_config, merge_specs, peek, schema_of
 
 __version__ = "0.15.0"
 
-# What a config-driven script uses. Everything a schema is ASKED is a method of `Schema`, so one name
-# comes out of the schema layer instead of a handful of free functions doing one call each; the loader's
-# own record types (Claim, Composed, Key) stay in slimconfig.config, where a caller who wants them will
-# already be reading compose().
+# The public API; loader record types (Claim, Composed, Key) stay in slimconfig.config.
 __all__ = [
     "Config",
     "Run",

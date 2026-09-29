@@ -1,69 +1,16 @@
-# slimconfig.schemas — the config-class layer: what a schema may look like, and how a YAML names one.
+# slimconfig.schemas — config classes: what a schema may look like, and how a YAML names one.
 #
-# A schema is a @dataclass subclassing `Config`, and a dataclass field is one of three things:
-#
-#   a LEAF     a scalar, a list, a dict of values — a value.
-#   a GROUP    another config class: a named group of values, nested.
-#   a TABLE    `dict[SomeEnum, C]` for a config class C: SEVERAL of that group, keyed — one entry per
-#              model, per method, per whatever the Enum names. The entries are validated exactly like a
-#              group is (unknown key rejected, types checked), and the keys are checked too.
-#
-# EVERY KEY A CONFIG FILE WRITES IS REGISTERED SOMEWHERE — a field of a config class, or a member of an
-# Enum. That is why a mapping, leaf or table, is keyed by an Enum and never by a bare `str`: a
-# `dict[str, ...]` takes any word at all, and a word nothing declared is one a reader cannot look up and
-# a typo nothing can catch. It reads as a set of choices and behaves as a hole. Such a key is written in
-# YAML as the member's VALUE, the same spelling the Enum has anywhere else in a config.
-#
-# Nothing else is a config. That is the whole shape rule, and `Schema.check` enforces it before a load,
-# so a schema that cannot be filled from YAML says so at import time rather than deep inside a merge.
-#
-# ONE BASE CLASS, AND IT IS NOT OPTIONAL. Every config class subclasses `Config` — the root, every
-# nested group, every table's entry class. Being a config class is then something a class SAYS rather
-# than something a loader infers from its shape, which buys the one thing inference cannot: the rules
-# below run in `__init_subclass__`, at the `class` statement, so a schema that cannot be filled from
-# YAML fails when its module is imported and not at the first launch that happens to load it.
-#
-# WHAT A FIELD MAY BE DECLARED AS. A type hint on a config class is a promise to whoever reads the
-# YAML, so it may only say things that are kept: a value is a str / int / float / bool / Enum, a union
-# of those, a list or dict of any of that, and any of it `| None`. `Any`, a bare `list`, a `tuple`
-# (which comes back a list), a `set` or `Literal` (which OmegaConf cannot hold at all), a `Path` (which
-# cannot round-trip through a run snapshot), a union holding a container (which OmegaConf rejects
-# outright) — each is rejected by name, at the class, with what to write instead.
-#
-# ONE OBJECT FOR A CONFIG CLASS. Everything the rest of the package asks of a schema — its name, its
-# fields, whether it is well formed, which class sits at a given node of it — is a method of `Schema`,
-# so those questions are asked the same way everywhere instead of through free functions each
-# re-deriving the same walk. What is left at module level is what is not about one class: the naming
-# rules (`schema_name` and the declaration it writes), and the declaration rules, which run at the
-# `class` statement, before any Schema exists.
-#
-# ONE THING TO KNOW ABOUT MERGING A LEAF THAT IS A MAPPING. Every mapping merges key by key — that is
-# OmegaConf's rule and slimconfig does not change it — so a later spec setting `weights: {a: 1, b: 1}`
-# on top of `{a: 1, c: 1}` yields all three keys, not two. For a GROUP or a TABLE that is exactly right.
-# For a leaf that happens to be a `dict[SomeEnum, float]` it is usually not what the writer meant: such a
-# layer can ADD a key but never DROP one. If a mapping-valued leaf is a set of things and a config needs
-# to state a different set, do not layer it — give each variant its own whole value, at a node where
-# only one variant can apply.
-#
-# GROUPS ARE COMPOSED, NOT INHERITED. A config class that needs another one's fields declares a field
-# of that type; it does not inherit it as a mixin. Inheriting flattens the borrowed fields into the
-# parent's own namespace, so the YAML cannot say where a value came from and two mixins can silently
-# collide on a name. A nested field gives the group a name in the class AND the same name in the YAML,
-# which is what makes a hierarchical config readable — and what lets a shared fragment be mounted at
-# exactly one place (see the `_default:` rule in config.py).
-#
-# NAMING A CLASS FROM YAML. Every config file, and every mapping in one that fills a config class,
-# states which class — and, because a group and a table are the same mapping shape on the page, the
-# declaration says which of the two it is:
-#     optim > myproject.train.OptimConfig:          this mapping IS an OptimConfig
-#     data > dict[myproject.tasks.Task, ...Data]:   its ENTRIES each are a Data, keyed by that Enum
-# A file names its own class the same way, on the reserved key `_`: `_ > myproject.train.TrainConfig:`.
-# The second spelling is the field's own annotation, written out, so a table names its entry class once
-# for all of its entries instead of once per entry — and an entry, whose class the table already fixed,
-# names nothing. `Schema.declared` reads a line; `Schema.resolve` imports the class in it;
-# `Schema.require` says which class belongs at a given node of a parent schema; and load_config checks
-# they agree. A renamed or moved class therefore breaks its configs loudly, which is the point — a
-# config file is written against a class, and that dependency should be visible.
+# A schema is a @dataclass subclassing `Config`; each field is one of three shapes:
+#   a LEAF   a value: a scalar, a list, or a dict of values.
+#   a GROUP  another config class, nested.
+#   a TABLE  `dict[SomeEnum, C]` for a config class C: several C, one per Enum member.
+# Every config class (root, group, table entry) subclasses `Config`, and is checked at its `class` statement.
+# A value is a str / int / float / bool / Enum, a union of those, a list or dict of any of it, or `| None`.
+# A mapping is keyed by an Enum, never a bare `str`; in YAML a key is written as the member's value.
+# A YAML names the class of each mapping it fills:
+#     optim > pkg.mod.OptimConfig:             this mapping IS an OptimConfig
+#     data > dict[pkg.mod.Task, pkg.mod.Data]:  its entries each are a Data, keyed by Task
+#     _ > pkg.mod.TrainConfig:                 the file's own class, on the reserved key `_`
 
 from __future__ import annotations
 
@@ -92,17 +39,14 @@ __all__ = [
     "value_error",
 ]
 
-# WHERE A NODE IS, SPELLED AS THE KEYS AND NOT AS ONE STRING. A dotted path is the convenient way to
-# WRITE one by hand (`optim.lr`), but it cannot say what a key with a dot in it is: `overrides.model.
-# flux.1-dev` is four keys or five depending on the table's keys, and only whoever walked the mapping
-# knows which. So compose() reports a claim's node as the tuple of keys it actually descended, and
-# anything that resolves a node takes either — a string is split on ".", a sequence is taken as given.
+# A path into a schema: a dotted string, or the keys themselves. A sequence is needed because a table key
+# may contain a dot (`flux.1-dev`), which a dotted string cannot tell apart from nesting.
 type Node = str | Sequence[str]
 
 
 class Shape(NamedTuple):
-    """What is at one place in a schema. A FIELD holds one of the first three; walking a node can also
-    land on the last two, since a table and one of its entries are the same field:
+    """What is at one place in a schema. A field is one of the first three; a walk can also land on the
+    last two:
 
         ("value", None)   a leaf — a scalar, a list, or a dict of plain values
         ("group", C)      one nested config class: the YAML block filling it must name it
@@ -121,7 +65,7 @@ _TABLE = re.compile(r"dict\[\s*(?P<key>[\w.]+)\s*,\s*(?P<value>[\w.]+)\s*\]")
 
 
 class Declaration(NamedTuple):
-    """What one declaration SAYS the mapping under it is:
+    """What one declaration says the mapping under it is:
 
         optim > pkg.module.Optim:            Declaration(Schema(Optim), None)   — this mapping IS one
         data > dict[pkg.mod.Task, ...Data]:  Declaration(Schema(Data), Task)    — its ENTRIES each are
@@ -131,11 +75,8 @@ class Declaration(NamedTuple):
     key: type | None  # the type a table's keys have; None for a group
 
 
-# THE SCRIPT THAT WAS LAUNCHED IS `__main__`. A config class defined in the entry point itself lives in a
-# module named `__main__`, which is not a name a config file can use — and importing that script again
-# under its real name (`train`) would RUN it a second time and hand back a different class object, so
-# every `issubclass` against it would fail. The two names are therefore treated as one: `schema_name`
-# writes the script's own name, and `Schema.resolve` hands back the already-running module for it.
+# The names the launched script goes by. A class defined there lives in `__main__`, and re-importing the
+# script under its real name would run it again and yield a different class, so the two are treated as one.
 def _main_names() -> tuple[str, ...]:
     main = sys.modules.get("__main__")
     spec = getattr(main, "__spec__", None)  # set by `python -m pkg.mod`
@@ -149,8 +90,7 @@ def _import_module(name: str) -> Any:
     return importlib.import_module(name)
 
 
-# The object a dotted path names, or None if nothing of that name can be imported. The path is split at
-# the last import that succeeds, so both `pkg.module.Class` and `pkg.module.Outer.Inner` resolve.
+# The object a dotted path names, or None; handles nested classes (`pkg.module.Outer.Inner`).
 def _import_dotted(dotted: str) -> Any:
     parts = dotted.split(".")
     for split in range(len(parts) - 1, 0, -1):
@@ -170,8 +110,7 @@ def _import_dotted(dotted: str) -> Any:
     return None
 
 
-# The dotted path a YAML names `cls` by — the inverse of Schema.resolve, used in every error message so
-# a mismatch can be fixed by copying the name out of it.
+# The dotted path a YAML names `cls` by — the inverse of `Schema.resolve`.
 def schema_name(cls: type) -> str:
     module = cls.__module__
     if module == "__main__":
@@ -179,11 +118,7 @@ def schema_name(cls: type) -> str:
     return f"{module}.{cls.__qualname__}"
 
 
-# How a YAML declares a mapping of `cls`: the class's dotted path for ONE of it, `dict[K, path]` for a
-# table of them. The two spellings are what tell a block filling a group apart from a table whose every
-# entry fills one — the same mapping shape, and without the `dict[...]` a reader cannot say which they
-# are looking at. BOTH names in a `dict[...]` are import paths, with no exception: a key type spelled as
-# a bare word would be the one name in a config file that names nothing a reader can open.
+# How a YAML declares `cls`: its dotted path for a group, `dict[K, path]` for a table of them.
 def declaration_name(cls: type, key: type | None = None) -> str:
     return schema_name(cls) if key is None else f"dict[{key_name(key)}, {schema_name(cls)}]"
 
@@ -193,10 +128,7 @@ def key_name(key: type) -> str:
     return schema_name(key)
 
 
-# The other half of a `dict[...]`: the type a table's keys have, imported the same way the entry class
-# beside it is — an Enum, named in full. Resolving it rather than comparing spellings is what makes the
-# declaration checkable AND followable: the check is then whether the file named the same TYPE the field
-# declared, and a reader can open the name to see which keys there are.
+# Import the key type of a `dict[...]` declaration, which must be an Enum.
 def _resolve_key(dotted: str, spelled: str) -> type:
     obj = _import_dotted(dotted)
     if _is_enum(obj):
@@ -207,8 +139,7 @@ def _resolve_key(dotted: str, spelled: str) -> type:
     )
 
 
-# `X | None` -> X. Anything else — including a union of several real types — is handed back as it is,
-# for the caller to classify or to reject.
+# `X | None` -> X; anything else is returned unchanged.
 def optional(annotation: Any) -> Any:
     if get_origin(annotation) in (Union, types.UnionType):
         inner = [a for a in get_args(annotation) if a is not type(None)]
@@ -217,8 +148,7 @@ def optional(annotation: Any) -> Any:
     return annotation
 
 
-# What an annotation describes — a value, a nested config class, or a table of one. `X | None` counts as
-# whatever X is: an optional group is still a group, and OmegaConf nests it the same way.
+# The Shape an annotation describes; `X | None` counts as whatever X is.
 def _shape_of(annotation: Any) -> Shape:
     annotation = optional(annotation)
     if dataclasses.is_dataclass(annotation) and isinstance(annotation, type):
@@ -236,8 +166,7 @@ def _keys(node: Node) -> list[str]:
     return [k for k in node.split(".") if k] if isinstance(node, str) else list(node)
 
 
-# One key on from `here`: under a table the key names an ENTRY, whose class the table already fixed;
-# under a config class it names a field. Nothing is below a leaf or below a key that placed nowhere.
+# One key on from `here`: under a table the key names an entry, otherwise a field.
 def _step(here: Shape, key: str) -> Shape:
     if here.kind == "table":
         return Shape("entry", here.cls)
@@ -248,7 +177,6 @@ def _step(here: Shape, key: str) -> Shape:
 
 # ── what a field may be declared as ──────────────────────────────────────────
 
-# What a YAML scalar can BE, and OmegaConf can then hold to the declaration.
 _SCALARS: tuple[type, ...] = (str, int, float, bool)
 
 
@@ -257,16 +185,13 @@ def _is_enum(annotation: Any) -> bool:
 
 
 def _shown(annotation: Any) -> str:
-    """An annotation spelled as the reader wrote it, near enough to find in the file."""
+    """An annotation spelled roughly as written."""
     if isinstance(annotation, type):
         return annotation.__name__
     return str(annotation).replace("typing.", "")
 
 
-# Why `annotation` is not a config VALUE — None if it is one. A value is a str / int / float / bool /
-# Enum, a list or dict of those (nested as deep as it likes), and any of that `| None`. Everything else
-# is rejected here, at the class, rather than at the first config that trips over it — or, worse, not
-# at all: OmegaConf lets a `list[str]` hold a mapping, and `Any` lets anything hold anything.
+# Why `annotation` is not a config value type, or None if it is.
 def _value_error(annotation: Any) -> str | None:
     origin = get_origin(annotation)
     if origin in (Union, types.UnionType):
@@ -274,7 +199,7 @@ def _value_error(annotation: Any) -> str | None:
         if len(inner) == 1:
             return _value_error(inner[0])
         held = next((a for a in inner if not (a in _SCALARS or _is_enum(a))), None)
-        if held is not None:  # OmegaConf holds a union of scalars and says so; a container it cannot
+        if held is not None:  # OmegaConf rejects a union holding a container
             return (
                 f"a union may only offer scalars — one of a str, an int, a float, a bool or an Enum — "
                 f"and {_shown(held)} is not one"
@@ -327,11 +252,8 @@ def _value_error(annotation: Any) -> str | None:
     )
 
 
-# Why `value` is not what `annotation` promised — None if it is. The other half of the rule above: a
-# declaration is worth what is checked against it, and OmegaConf checks a scalar but will happily let a
-# `list[str]` hold a mapping and a `dict[K, str]` hold a list. The message is a SUFFIX, so a caller
-# that knows the field's name can print the whole path to the value that is wrong: `tags[1] is not a
-# str: {'a': 1}`.
+# Why `value` does not match `annotation`, or None. OmegaConf does not check container contents, so this
+# does. Returns a suffix for the caller to prefix with the field path, e.g. `tags[1] is not a str: {'a': 1}`.
 def value_error(value: Any, annotation: Any) -> str | None:
     ann = optional(annotation)
     if value is None:  # whether null is allowed at all is OmegaConf's own check, at merge time
@@ -366,9 +288,7 @@ def value_error(value: Any, annotation: Any) -> str | None:
     return None if held_ok else f" is not a {ann.__name__}: {value!r}"
 
 
-# The default a field was declared with, whichever side of the `@dataclass` decorator we are on: what
-# the class body wrote (`field(default_factory=Optim)`) before it runs, and the dataclasses.Field it
-# became after — both answer `.default_factory`, which is the only thing asked of it.
+# A field's declared default, before or after `@dataclass` has run (both expose `.default_factory`).
 def _default_of(cls: type, name: str) -> Any:
     fields = cls.__dict__.get("__dataclass_fields__")
     if fields is not None and name in fields:
@@ -413,8 +333,7 @@ def _declaration_error(owner: str, name: str, annotation: Any, default: Any) -> 
     return f"{where} is typed `{_shown(annotation)}`: {problem}" if problem else None
 
 
-# Hold every field `cls` declares to the rules above, and raise TypeError naming the first that breaks
-# one. Only the class's OWN annotations: whatever it inherited was checked where it was written.
+# Check every field `cls` itself declares, raising TypeError for the first that breaks a rule.
 def check_declaration(cls: type) -> None:
     hints = get_type_hints(cls)
     owner = schema_name(cls)
@@ -427,10 +346,8 @@ def check_declaration(cls: type) -> None:
             raise TypeError(problem)
 
 
-# A class whose annotations named something not yet defined — a group declared above the class it holds,
-# say. Checking it is postponed to the next `class ... (Config)` statement, by when the name it waited
-# for normally exists; anything still deferred is checked by Schema.check before a load, so a class is
-# never let through unchecked, only checked late.
+# Classes whose annotations forward-reference a later name; retried at the next `Config` subclass, and
+# always by `Schema.check` before a load.
 _deferred: list[type] = []
 
 
@@ -444,19 +361,13 @@ def _settle() -> None:
 
 
 class Config:
-    """The base class of every config class — the root of a schema, every nested group, every table
-    entry.
+    """The base class of every config class — the root, every nested group, every table entry.
 
         @dataclass
         class Optim(Config):
             lr: float = MISSING
 
-    It carries no fields and no behaviour: what it is for is to make "this class is filled from YAML"
-    something a class SAYS, so the rules that come with saying it can run at the `class` statement.
-    Each field's type hint is checked against what a config value may be (see `_value_error`), each
-    nested group against the `default_factory` it needs, and each group and table entry against this
-    same base — so a schema that cannot be filled fails at the import of the module that declares it,
-    naming the field, instead of at the first launch that loads one.
+    It has no fields; subclassing it checks the class's declarations at the `class` statement.
     """
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -479,8 +390,7 @@ class Schema:
         Schema.resolve("myproject.train.Optim")  -> Schema(Optim)
         Schema.declared("dict[..Task, ..Data]")  -> Declaration(Schema(Data), Task)
 
-    A Schema wraps a class and holds nothing else, so two of the same class are equal and either may be
-    built wherever it is wanted; nothing is cached that a reloaded module could make stale.
+    Holds only the class and caches nothing.
     """
 
     cls: type
@@ -523,8 +433,7 @@ class Schema:
     def name(self) -> str:
         return schema_name(self.cls)
 
-    # Read one declaration: the class it names, and — if it spells a table — what it says the keys
-    # are. `resolve` answers the first half and is what a group needs; this answers the whole line.
+    # Parse a whole declaration: the class it names and, for a table, the key type.
     @classmethod
     def declared(cls, text: str) -> Declaration:
         if not isinstance(text, str) or not text.strip():
@@ -548,25 +457,19 @@ class Schema:
 
     # ── fields ───────────────────────────────────────────────────────────────
 
-    # What each of this class's fields holds, {name: Shape}, with string annotations resolved.
+    # The Shape of each field, {name: Shape}.
     @property
     def fields(self) -> dict[str, Shape]:
         hints = get_type_hints(self.cls)
         return {f.name: _shape_of(hints.get(f.name, f.type)) for f in dataclasses.fields(self.cls)}
 
-    # The annotations themselves, for the one question `fields` cannot answer: not what SHAPE a field
-    # holds but exactly which type it promised — `list[str]` and `dict[K, float]` are both leaves.
+    # The resolved type hints, for when the exact type matters and not just the Shape.
     @property
     def hints(self) -> dict[str, Any]:
         return get_type_hints(self.cls)
 
-    # Reject a schema that cannot be filled from a YAML file, naming the field that breaks it. Every
-    # class reachable from this one is held to the rules its own `class` statement ran
-    # (`check_declaration`: each field's type hint is a type a config value may have, each group carries
-    # `field(default_factory=<its class>)`, each group and entry class subclasses Config) — re-run here
-    # so a schema is checked in full before a load even if a forward reference postponed it, and so one
-    # `check()` is a complete answer on its own. Plus the one rule that is not about a single class: the
-    # nesting must terminate, since a schema that contains itself has no finite YAML.
+    # Check this class and every class reachable from it, including any whose check was deferred, and
+    # reject a schema that contains itself.
     def check(self, _seen: tuple[type, ...] = ()) -> None:
         if self.cls in _seen:
             chain = " -> ".join(schema_name(c) for c in (*_seen, self.cls))
@@ -581,11 +484,7 @@ class Schema:
 
     # ── nodes ────────────────────────────────────────────────────────────────
 
-    # Step a node through this schema one key at a time, saying what each prefix lands on. A table is
-    # stepped through by naming one of its entries — `overrides.task.dreambooth` lands on the table's
-    # value class — because an entry is a group and the table itself is not: it has no class of its own
-    # to fill, only however many the keys name. The walk stops at the first key it cannot place; nothing
-    # below a leaf or an unknown key is a node of this schema.
+    # Yield (prefix, Shape) for each key of `node`, stopping at the first unknown one.
     def walk(self, node: Node) -> Iterator[tuple[tuple[str, ...], Shape]]:
         here, walked = Shape("group", self.cls), []
         for key in _keys(node):
@@ -595,16 +494,14 @@ class Schema:
             if here.kind == "unknown":
                 return
 
-    # What `node` lands on — see Shape. This schema itself for the empty path. The non-raising half of
-    # `require`, for a caller that wants to ASK rather than require.
+    # The Shape at `node` (this schema for the empty path); the non-raising version of `require`.
     def at(self, node: Node) -> Shape:
         here = Shape("group", self.cls)
         for _, here in self.walk(node):
             pass  # the last step walked is the answer
         return here
 
-    # The config class that belongs at `node`; this schema itself for the empty path. Raises if the path
-    # does not land on a config class, which is what a `_default:` under a leaf field looks like.
+    # The config class at `node` (this schema for the empty path); raises unless it is a group or entry.
     def require(self, node: Node) -> Schema:
         here, walked = Shape("group", self.cls), ()
         for walked, here in self.walk(node):  # the LAST step walked is the answer
