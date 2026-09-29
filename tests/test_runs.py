@@ -12,7 +12,7 @@ import fixtures
 import pytest
 from omegaconf import OmegaConf
 
-from slimconfig import load_config, run, start_run, tee_stdout
+from slimconfig import Run, load_config, run, start_run, tee_stdout
 
 FULL = """
 model: llama
@@ -196,6 +196,34 @@ def test_run_reports_usage_when_given_no_config_and_the_schema_is_not_complete(m
     message = str(launch(monkeypatch, [], train))
     assert "missing required field(s): model" in message  # what the run is short of, named
     assert "usage: train.py <config.yaml>" in message  # and where such a field is filled in
+
+
+# ── run: a Run class in place of the function ────────────────────────────────
+
+
+def test_run_takes_a_run_class_and_calls_its_main(tmp_path, monkeypatch, write):
+    class Train(Run):
+        config: fixtures.TrainConfig
+
+        def main(self) -> int:
+            print(f"training {self.config.model}")
+            (Path(self.run_dir) / "result.txt").write_text(self.config.model)
+            return 0
+
+    argv = [write(tmp_path / "a.yaml", FULL), "--run-dir", str(tmp_path / "run")]
+    assert launch(monkeypatch, argv, Train, log="train.log") == 0
+    assert (tmp_path / "run" / "config.yaml").is_file()
+    assert (tmp_path / "run" / "result.txt").read_text() == "llama"
+    assert "training llama" in (tmp_path / "run" / "train.log").read_text()
+
+
+def test_a_run_class_must_annotate_its_config_class(monkeypatch):
+    class Train(Run):
+        def main(self) -> None:
+            raise AssertionError("must not run")
+
+    with pytest.raises(TypeError, match="Train's `config` must be annotated with its config class"):
+        launch(monkeypatch, [], Train)
 
 
 # ── run: where it writes is the launcher's, not the config's ─────────────────

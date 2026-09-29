@@ -26,11 +26,11 @@
 from .config import compose, load_mapping_yaml, load_yaml
 from .partials import is_partial, partial_of, stated
 from .paths import project_root, resolve_path
-from .runs import run, start_run, tee_stdout
+from .runs import Run, run, start_run, tee_stdout
 from .schemas import Config, Schema
 from .structured import Spec, load_config, merge_specs, peek, schema_of
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 # What a config-driven script uses. Everything a schema is ASKED is a method of `Schema`, so one name
 # comes out of the schema layer instead of a handful of free functions doing one call each; the loader's
@@ -38,6 +38,7 @@ __version__ = "0.14.0"
 # already be reading compose().
 __all__ = [
     "Config",
+    "Run",
     "Schema",
     "Spec",
     "compose",

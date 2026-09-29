@@ -2,6 +2,7 @@
 #
 #   * run        — the launcher, and the whole of a script's __main__: the function to run, the config to
 #                  run it on, and the folder to run it into.
+#   * Run        — the class form of that function, for a routine that is several methods sharing state.
 #   * start_run  — the snapshot on its own (config.yaml + metadata.json), for a routine that opens a
 #                  second folder of its own (one cell of a sweep, say).
 #   * tee_stdout — the log on its own.
@@ -22,6 +23,7 @@
 
 from __future__ import annotations
 
+import abc
 import contextlib
 import dataclasses
 import inspect
@@ -40,7 +42,7 @@ from .config import ARROW, ROOT_NAME
 from .schemas import Config, Schema, Shape, declaration_name
 from .structured import Spec, load_config
 
-__all__ = ["run", "start_run", "tee_stdout"]
+__all__ = ["Run", "run", "start_run", "tee_stdout"]
 
 # Where a run writes, spelled on the command line. Both take `--flag value` or `--flag=value`.
 RUN_DIR_FLAG = "--run-dir"
@@ -227,13 +229,44 @@ class _RunFolder:
             yield self.path
 
 
+class Run(abc.ABC):
+    """A run as a class: the config it runs on, the folder it runs into, and `main`, the work it does.
+
+    The class form of a `run` function, for a routine whose work is several methods sharing state. A
+    subclass annotates `config` with its config class — the same promise a function's first argument
+    makes — implements `main`, and is handed to `run` in place of a function: `run(Train)`.
+    """
+
+    config: Config
+    run_dir: str
+
+    def __init__(self, config: Config, run_dir: str) -> None:
+        self.config = config
+        self.run_dir = run_dir
+
+    @abc.abstractmethod
+    def main(self) -> int | None:
+        """The run's work; results go under `self.run_dir`. Returns this process's exit status."""
+
+
+# A config class is a @dataclass subclassing Config: what an entry point's annotation must name.
+def _config_class(owner: str, where: str, schema: Any) -> type:
+    if not (isinstance(schema, type) and dataclasses.is_dataclass(schema) and issubclass(schema, Config)):
+        raise TypeError(
+            f"{owner}'s {where} must be annotated with its config class "
+            f"(a @dataclass subclassing slimconfig.Config), got {schema!r}"
+        )
+    return schema
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class _Entrypoint:
     """The routine `run` was given, and what its signature says it wants.
 
     A function IS its config — one annotated argument, so the entry point names the routine and the
     schema comes with it — plus an OPTIONAL second argument, `run_dir: str`, for a routine that writes
-    into the folder (which is most of them).
+    into the folder (which is most of them). A `Run` subclass is the same promise made by its `config`
+    annotation, and always takes the folder.
     """
 
     function: Callable[..., int | None]
@@ -241,7 +274,11 @@ class _Entrypoint:
     wants_run_dir: bool
 
     @classmethod
-    def of(cls, function: Callable[..., int | None]) -> _Entrypoint:
+    def of(cls, function: Callable[..., int | None] | type[Run]) -> _Entrypoint:
+        if isinstance(function, type) and issubclass(function, Run):
+            run_class = function
+            schema = _config_class(run_class.__qualname__, "`config`", get_type_hints(run_class).get("config"))
+            return cls(lambda cfg, run_dir: run_class(cfg, run_dir).main(), schema, True)
         if not callable(function):
             raise TypeError(f"run() takes a function of one config argument, not {type(function).__name__}")
         name = getattr(function, "__qualname__", repr(function))
@@ -252,12 +289,7 @@ class _Entrypoint:
                 f"not {len(params)}"
             )
         hints = get_type_hints(function)
-        schema = hints.get(params[0].name)
-        if not (isinstance(schema, type) and dataclasses.is_dataclass(schema) and issubclass(schema, Config)):
-            raise TypeError(
-                f"{name}'s argument `{params[0].name}` must be annotated with its config class "
-                f"(a @dataclass subclassing slimconfig.Config), got {schema!r}"
-            )
+        schema = _config_class(name, f"argument `{params[0].name}`", hints.get(params[0].name))
         if len(params) == 2 and hints.get(params[1].name) is not str:
             raise TypeError(
                 f"{name}'s second argument `{params[1].name}` is the run folder and must be annotated "
@@ -381,7 +413,7 @@ def _usage(extra: str = "") -> NoReturn:
 # `run` never returns — it exits with the function's status — so a script's __main__ spells neither
 # sys.argv nor SystemExit.
 def run(
-    function: Callable[..., int | None],
+    function: Callable[..., int | None] | type[Run],
     config: str | None = None,
     /,
     *,
