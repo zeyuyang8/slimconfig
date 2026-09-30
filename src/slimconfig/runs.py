@@ -13,6 +13,7 @@ from __future__ import annotations
 import abc
 import contextlib
 import dataclasses
+import enum
 import inspect
 import json
 import os
@@ -92,12 +93,23 @@ def _declares(key: str, cls: type, table_key: type | None = None) -> str:
     return f"{key} {ARROW} {declaration_name(cls, table_key)}"
 
 
+# Write every Enum member, key or value, as its value — how a config file spells it.
+def _enum_values(node: Any) -> Any:
+    if isinstance(node, enum.Enum):
+        return node.value
+    if isinstance(node, Mapping):
+        return {_enum_values(k): _enum_values(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_enum_values(v) for v in node]
+    return node
+
+
 # The snapshot's YAML text; only a Config instance gets class declarations.
 def _snapshot(config: Any) -> str:
     node = _as_dictconfig(config)
     if not isinstance(config, Config):
         return OmegaConf.to_yaml(node, resolve=True)
-    container = OmegaConf.to_container(node, resolve=True, enum_to_str=True)
+    container = _enum_values(OmegaConf.to_container(node, resolve=True))
     root = Schema(type(config))
     body = OmegaConf.to_yaml(OmegaConf.create(_stamp(cast(Mapping, container), root)))
     return f"{_declares(ROOT_NAME, type(config))}:\n{body}"

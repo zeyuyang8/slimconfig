@@ -70,6 +70,16 @@ def test_a_snapshot_of_a_matrix_stamps_its_blocks_and_still_reloads(tmp_path, wr
     assert load_config(fixtures.MatrixConfig, [f"{run_dir}/config.yaml"]) == cfg
 
 
+def test_a_snapshot_writes_an_enum_as_its_value(tmp_path, write):
+    # `flux_dev` is the member's name; a config file spells it by its value, and so does the snapshot.
+    body = "per_model > dict[fixtures.Backbone, fixtures.TrainPart]:\n  flux.1-dev:\n    model: a\n"
+    cfg = load_config(fixtures.ModelMatrix, [write(tmp_path / "m.yaml", body, schema="fixtures.ModelMatrix")])
+    run_dir = start_run(str(tmp_path / "run"), cfg)
+    text = (tmp_path / "run" / "config.yaml").read_text()
+    assert "  flux.1-dev:\n" in text and "flux_dev" not in text
+    assert load_config(fixtures.ModelMatrix, [f"{run_dir}/config.yaml"]) == cfg
+
+
 def test_a_snapshot_leaves_an_unset_table_alone(tmp_path, write):
     # A layer's unset table is not a table in the snapshot, it is `???` — there is no block to stamp.
     body = "per_stage: {}\nbase > fixtures.SearchPart:\n  trials: 4\n"
