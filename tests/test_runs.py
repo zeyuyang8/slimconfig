@@ -113,14 +113,13 @@ def test_tee_stdout_writes_to_the_file_and_the_terminal(tmp_path, capsys):
     assert (tmp_path / "logs" / "run.log").read_text() == "hello\n"
 
 
-def test_tee_stdout_appends_across_runs_with_a_banner(tmp_path):
+def test_tee_stdout_rewrites_the_log_on_a_rerun(tmp_path):
     log = str(tmp_path / "run.log")
     with tee_stdout(log, banner="=== first ==="):
         print("one")
     with tee_stdout(log, banner="=== second ==="):
         print("two")
-    text = (tmp_path / "run.log").read_text()
-    assert text == "=== first ===\none\n=== second ===\ntwo\n"
+    assert (tmp_path / "run.log").read_text() == "=== second ===\ntwo\n"
 
 
 def test_tee_stdout_is_undone_after_an_exception(tmp_path, capsys):

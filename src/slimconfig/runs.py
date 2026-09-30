@@ -163,13 +163,13 @@ class _Tee:
 
 
 # Also write everything printed inside the block to `path`. Stdout only (progress bars on stderr stay
-# out), appended (a resumed run keeps its history; `banner` goes to the file only), and parent process
-# only (children hold the real fd 1).
+# out), rewritten (a rerun into the same folder replaces the old log; `banner` goes to the file only),
+# and parent process only (children hold the real fd 1).
 @contextlib.contextmanager
 def tee_stdout(path: str, banner: str | None = None) -> Iterator[str]:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     real = sys.stdout
-    with open(path, "a", encoding="utf-8") as fh:
+    with open(path, "w", encoding="utf-8") as fh:
         if banner:
             fh.write(banner if banner.endswith("\n") else banner + "\n")
         sys.stdout = _Tee(real, fh)
@@ -330,7 +330,7 @@ def _launch(
         )
 
     start_run(where, cfg)
-    banner = f"\n═══ {datetime.now(UTC).isoformat(timespec='seconds')} · {' '.join(sys.argv)} ═══"
+    banner = f"═══ {datetime.now(UTC).isoformat(timespec='seconds')} · {' '.join(sys.argv)} ═══"
     with tee_stdout(os.path.join(where, LOG), banner=banner):
         status = call(cfg, where)
     raise SystemExit(status)
