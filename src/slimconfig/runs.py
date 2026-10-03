@@ -7,6 +7,10 @@
 #     python train.py config=configs/train.yaml home=runs/exp1 -- optim.lr=1e-4
 # `config=` may repeat (merged left to right), `home=` is the run folder, overrides go after `--`, and
 # the log is always `run.log` in the folder.
+#
+# A run may also declare a typed output (see slimconfig.outputs): `output: Score` on a Run, or `-> Score`
+# on run's function. Its main then returns a Score, which the launcher checks and writes to the folder as
+# output.json; the run exits 0. Without one, main returns the exit status, as before.
 
 from __future__ import annotations
 
@@ -27,6 +31,7 @@ from typing import Any, NoReturn, cast, get_type_hints
 from omegaconf import DictConfig, OmegaConf
 
 from .config import ARROW, ROOT_NAME
+from .outputs import Output, output_class, write_output
 from .schemas import Config, Schema, Shape, declaration_name
 from .structured import Spec, load_config
 
@@ -197,17 +202,20 @@ class Run(abc.ABC):
         self._launch = (config, home, overrides)
 
     @abc.abstractmethod
-    def main(self) -> int | None:
-        """The run's work, writing under `self.run_dir`; returns the exit status."""
+    def main(self) -> Any:
+        """The run's work, writing under `self.run_dir`; returns the declared `output`, or else the
+        exit status."""
 
     def run(self) -> NoReturn:
-        schema = _config_class(type(self).__qualname__, "`config`", get_type_hints(type(self)).get("config"))
+        owner, hints = type(self).__qualname__, get_type_hints(type(self))
+        schema = _config_class(owner, "`config`", hints.get("config"))
+        output = output_class(owner, "`output`", hints["output"]) if "output" in hints else None
 
-        def main(cfg: Any, run_dir: str) -> int | None:
+        def main(cfg: Any, run_dir: str) -> Any:
             self.config, self.run_dir = cfg, run_dir
             return self.main()
 
-        _launch(schema, main, *self._launch)
+        _launch(schema, main, *self._launch, output=output)
 
 
 # Check that an entry point's annotation is a config class (a @dataclass subclassing Config).
@@ -222,7 +230,7 @@ def _config_class(owner: str, where: str, schema: Any) -> type:
 
 # Split `run`'s function into its config class and a call taking (config, run_dir); the second
 # argument, `run_dir: str`, is optional.
-def _entrypoint(function: Callable[..., int | None]) -> tuple[type, Callable[[Any, str], int | None]]:
+def _entrypoint(function: Callable[..., Any]) -> tuple[type, Callable[[Any, str], Any]]:
     if not callable(function):
         raise TypeError(f"run() takes a function of one config argument, not {type(function).__name__}")
     name = getattr(function, "__qualname__", repr(function))
@@ -292,23 +300,31 @@ def _usage(extra: str = "") -> NoReturn:
 #
 # `run` never returns: it exits with the function's status (None -> 0).
 def run(
-    function: Callable[..., int | None],
+    function: Callable[..., Any],
     /,
     *,
     config: str | None = None,
     home: str | None = None,
     **overrides: Any,
 ) -> NoReturn:
-    _launch(*_entrypoint(function), config, home, overrides)
+    schema, call = _entrypoint(function)
+    returns = get_type_hints(function).get("return")
+    output = returns if isinstance(returns, type) and issubclass(returns, Output) else None
+    if output is not None:
+        output_class(getattr(function, "__qualname__", repr(function)), "return type", output)
+    _launch(schema, call, config, home, overrides, output=output)
 
 
-# The launch shared by `run` and `Run.run`.
+# The launch shared by `run` and `Run.run`; with an `output` class, the call's result is checked
+# against it and written to the folder as output.json.
 def _launch(
     schema: type,
-    call: Callable[[Any, str], int | None],
+    call: Callable[[Any, str], Any],
     config: str | None,
     home: str | None,
     overrides: dict[str, Any],
+    *,
+    output: type | None,
 ) -> NoReturn:
     configs, cli_home, cli_overrides = _parse(sys.argv[1:])
     if not configs and config is not None:
@@ -332,5 +348,10 @@ def _launch(
     start_run(where, cfg)
     banner = f"═══ {datetime.now(UTC).isoformat(timespec='seconds')} · {' '.join(sys.argv)} ═══"
     with tee_stdout(os.path.join(where, LOG), banner=banner):
-        status = call(cfg, where)
-    raise SystemExit(status)
+        result = call(cfg, where)
+    if output is None:
+        raise SystemExit(result)
+    if not isinstance(result, output):
+        raise TypeError(f"the run declares output {output.__qualname__} but returned {result!r}")
+    write_output(where, result)
+    raise SystemExit(0)
