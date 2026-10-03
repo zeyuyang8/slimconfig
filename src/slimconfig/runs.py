@@ -8,9 +8,9 @@
 # `config=` may repeat (merged left to right), `home=` is the run folder, overrides go after `--`, and
 # the log is always `run.log` in the folder.
 #
-# A run may also declare a typed output (see slimconfig.outputs): `output: Score` on a Run, or `-> Score`
-# on run's function. Its main then returns a Score, which the launcher checks and writes to the folder as
-# output.json; the run exits 0. Without one, main returns the exit status, as before.
+# A Run may also declare its folder's contents (see slimconfig.layouts): `layout: ChatLayout`. Its main
+# then finds the layout's folders created and sets its outputs; the run writes them, records the layout
+# in metadata.json, and fails on anything in the folder the layout does not declare.
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from typing import Any, NoReturn, cast, get_type_hints
 from omegaconf import DictConfig, OmegaConf
 
 from .config import ARROW, ROOT_NAME
-from .outputs import Output, output_class, write_output
+from .layouts import close_layout, describe, open_layout, parts
 from .schemas import Config, Schema, Shape, declaration_name
 from .structured import Spec, load_config
 
@@ -122,7 +122,7 @@ def _snapshot(config: Any) -> str:
 
 # Create `run_dir` and write config.yaml (resolved, re-runnable) and metadata.json (argv, cwd, git,
 # time, host). The folder must be creatable; the snapshot is best-effort and never aborts a run.
-def start_run(run_dir: str, config: Any) -> str:
+def start_run(run_dir: str, config: Any, layout: type | None = None) -> str:
     os.makedirs(run_dir, exist_ok=True)
     try:
         # Render both payloads before opening a file: re-running from a snapshot passes the very
@@ -135,6 +135,7 @@ def start_run(run_dir: str, config: Any) -> str:
             "started": datetime.now(UTC).isoformat(timespec="seconds"),
             "host": socket.gethostname(),
             **_git_head(),
+            **({} if layout is None else {"layout": describe(layout)}),
         }, indent=2, sort_keys=True)
         with open(os.path.join(run_dir, "config.yaml"), "w", encoding="utf-8") as f:
             f.write(snapshot)
@@ -202,20 +203,27 @@ class Run(abc.ABC):
         self._launch = (config, home, overrides)
 
     @abc.abstractmethod
-    def main(self) -> Any:
-        """The run's work, writing under `self.run_dir`; returns the declared `output`, or else the
-        exit status."""
+    def main(self) -> int | None:
+        """The run's work, writing under `self.run_dir` (into `self.layout`, if it declares one);
+        returns the exit status."""
 
     def run(self) -> NoReturn:
         owner, hints = type(self).__qualname__, get_type_hints(type(self))
         schema = _config_class(owner, "`config`", hints.get("config"))
-        output = output_class(owner, "`output`", hints["output"]) if "output" in hints else None
+        layout = hints.get("layout")
+        if layout is not None:
+            parts(owner, layout)  # a layout class, checked before anything runs
 
-        def main(cfg: Any, run_dir: str) -> Any:
+        def main(cfg: Any, run_dir: str) -> int | None:
             self.config, self.run_dir = cfg, run_dir
-            return self.main()
+            if layout is None:
+                return self.main()
+            self.layout = open_layout(run_dir, layout)
+            status = self.main()
+            close_layout(run_dir, self.layout)
+            return status
 
-        _launch(schema, main, *self._launch, output=output)
+        _launch(schema, main, *self._launch, layout=layout)
 
 
 # Check that an entry point's annotation is a config class (a @dataclass subclassing Config).
@@ -230,7 +238,7 @@ def _config_class(owner: str, where: str, schema: Any) -> type:
 
 # Split `run`'s function into its config class and a call taking (config, run_dir); the second
 # argument, `run_dir: str`, is optional.
-def _entrypoint(function: Callable[..., Any]) -> tuple[type, Callable[[Any, str], Any]]:
+def _entrypoint(function: Callable[..., int | None]) -> tuple[type, Callable[[Any, str], int | None]]:
     if not callable(function):
         raise TypeError(f"run() takes a function of one config argument, not {type(function).__name__}")
     name = getattr(function, "__qualname__", repr(function))
@@ -300,31 +308,25 @@ def _usage(extra: str = "") -> NoReturn:
 #
 # `run` never returns: it exits with the function's status (None -> 0).
 def run(
-    function: Callable[..., Any],
+    function: Callable[..., int | None],
     /,
     *,
     config: str | None = None,
     home: str | None = None,
     **overrides: Any,
 ) -> NoReturn:
-    schema, call = _entrypoint(function)
-    returns = get_type_hints(function).get("return")
-    output = returns if isinstance(returns, type) and issubclass(returns, Output) else None
-    if output is not None:
-        output_class(getattr(function, "__qualname__", repr(function)), "return type", output)
-    _launch(schema, call, config, home, overrides, output=output)
+    _launch(*_entrypoint(function), config, home, overrides, layout=None)
 
 
-# The launch shared by `run` and `Run.run`; with an `output` class, the call's result is checked
-# against it and written to the folder as output.json.
+# The launch shared by `run` and `Run.run`; `layout`, if any, is recorded in metadata.json.
 def _launch(
     schema: type,
-    call: Callable[[Any, str], Any],
+    call: Callable[[Any, str], int | None],
     config: str | None,
     home: str | None,
     overrides: dict[str, Any],
     *,
-    output: type | None,
+    layout: type | None,
 ) -> NoReturn:
     configs, cli_home, cli_overrides = _parse(sys.argv[1:])
     if not configs and config is not None:
@@ -345,13 +347,8 @@ def _launch(
             "its config, its log and its results"
         )
 
-    start_run(where, cfg)
+    start_run(where, cfg, layout)
     banner = f"═══ {datetime.now(UTC).isoformat(timespec='seconds')} · {' '.join(sys.argv)} ═══"
     with tee_stdout(os.path.join(where, LOG), banner=banner):
-        result = call(cfg, where)
-    if output is None:
-        raise SystemExit(result)
-    if not isinstance(result, output):
-        raise TypeError(f"the run declares output {output.__qualname__} but returned {result!r}")
-    write_output(where, result)
-    raise SystemExit(0)
+        status = call(cfg, where)
+    raise SystemExit(status)

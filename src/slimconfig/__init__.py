@@ -14,10 +14,11 @@
 #   * every leaf is required; nothing is silently defaulted, and "off" is spelled `null`.
 #   * where a run writes is not config: `config=` and `home=` belong to the launcher; the log is `run.log`.
 #
-# A run may also return a typed output, a @dataclass subclassing `Output`, written to its folder as
-# output.json and read back with `load_output` (see slimconfig.outputs).
+# A Run may declare its folder's layout: typed outputs (`Output` classes, written as JSON) and folders,
+# created, checked and read back with `load_layout` (see slimconfig.layouts).
 
 from .config import compose, load_mapping_yaml, load_yaml
+from .layouts import Folder, Layout, load_layout
 from .outputs import Output, load_output, write_output
 from .partials import is_partial, partial_of, stated
 from .paths import project_root, resolve_path
@@ -25,11 +26,13 @@ from .runs import Run, run, start_run, tee_stdout
 from .schemas import Config, Schema
 from .structured import Spec, load_config, merge_specs, peek, schema_of
 
-__version__ = "0.16.0"
+__version__ = "0.17.0"
 
 # The public API; loader record types (Claim, Composed, Key) stay in slimconfig.config.
 __all__ = [
     "Config",
+    "Folder",
+    "Layout",
     "Output",
     "Run",
     "Schema",
@@ -37,6 +40,7 @@ __all__ = [
     "compose",
     "is_partial",
     "load_config",
+    "load_layout",
     "load_mapping_yaml",
     "load_output",
     "load_yaml",

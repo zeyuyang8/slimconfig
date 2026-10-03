@@ -1,17 +1,11 @@
-# slimconfig.outputs — typed results, the counterpart of typed configs: what a run produces, written to
-# its folder as output.json and read back into the same classes.
+# slimconfig.outputs — typed results, the counterpart of typed configs: a run's results as classes,
+# written as JSON and read back into the same classes, checked field by field. A run's layout (see
+# slimconfig.layouts) names which outputs it writes.
 #
 #     @dataclass
 #     class Score(Output):
 #         accuracy: float
 #         per_class: dict[str, float]
-#
-#     class Eval(Run):
-#         config: EvalConfig
-#         output: Score                           # main() returns a Score; the run writes output.json
-#         def main(self) -> Score: ...
-#
-#     score = load_output("runs/exp1", Score)     # the same Score back, checked field by field
 #
 # An output class is a @dataclass subclassing `Output`. Its fields may be str, int, float, bool, None,
 # an Enum (written as its value), a nested output class, `list[T]`, `dict[str, T]`, `T | None`, or `Any`
@@ -22,13 +16,10 @@ from __future__ import annotations
 import dataclasses
 import enum
 import json
-import os
 import types
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
-__all__ = ["OUTPUT", "Output", "load_output", "write_output"]
-
-OUTPUT = "output.json"  # the file a run's output is written to, in the run folder
+__all__ = ["Output", "load_output", "write_output"]
 
 
 class Output:
@@ -45,20 +36,19 @@ def output_class(owner: str, where: str, cls: Any) -> type:
     return cls
 
 
-# Write `output` as `run_dir/output.json`, Enums as their values; returns the path.
-def write_output(run_dir: str, output: Output) -> str:
+# Write `output` to the JSON file `path`, Enums as their values; returns the path.
+def write_output(path: str, output: Output) -> str:
     output_class(type(output).__qualname__, "type", type(output))
-    path = os.path.join(run_dir, OUTPUT)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(_plain(dataclasses.asdict(output)), f, indent=2)
         f.write("\n")
     return path
 
 
-# Read `run_dir/output.json` back into `cls`, checking every value against its field's type.
-def load_output[T](run_dir: str, cls: type[T]) -> T:
+# Read the JSON file `path` back into `cls`, checking every value against its field's type.
+def load_output[T](path: str, cls: type[T]) -> T:
     output_class(cls.__qualname__, "type", cls)
-    with open(os.path.join(run_dir, OUTPUT), encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         return _build(json.load(f), cls, cls.__name__)
 
 
