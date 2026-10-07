@@ -6,11 +6,11 @@ import enum
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import pytest
 
-from slimconfig import Output, load_output, write_output
+from slimconfig import Output, build_output, load_output, output_schema, plain_output, write_output
 
 
 class Grade(enum.Enum):
@@ -88,3 +88,80 @@ def test_only_an_output_class_is_written_or_loaded(tmp_path):
         write_output(str(tmp_path / "out.json"), Plain(1))  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="must be an output class"):
         load_output(str(tmp_path / "out.json"), Plain)
+
+
+# ── any JSON value, and its schema ───────────────────────────────────────────
+
+
+class Nutrient(enum.Enum):
+    KCAL = "kcal"
+    PROTEIN = "protein"
+
+
+@dataclass
+class Bound(Output):
+    min: float | None
+    max: float | None
+
+
+@dataclass
+class Meal(Output):
+    name: Annotated[str, "The meal's name"]
+    bounds: dict[Nutrient, Bound]
+    tags: list[str]
+
+
+def test_a_json_value_builds_into_its_class_and_back():
+    value = {"name": "dinner", "bounds": {"kcal": {"min": None, "max": 900}}, "tags": ["vegan"]}
+    meal = build_output(value, Meal)
+    assert meal.bounds == {Nutrient.KCAL: Bound(None, 900.0)}  # an Enum key is read from its value
+    assert plain_output(meal) == {**value, "bounds": {"kcal": {"min": None, "max": 900.0}}}
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        ({"name": "d", "bounds": {"fat": {"min": 1, "max": None}}, "tags": []}, r"'fat' is not a valid Nutrient"),
+        ({"name": "d", "bounds": {"kcal": {"min": 1}}, "tags": []}, r"Meal.bounds\[kcal\] is missing field\(s\): max"),
+        ({"name": 1, "bounds": {}, "tags": []}, r"Meal.name is not a str"),
+    ],
+)
+def test_a_json_value_is_checked_against_its_class(value, match):
+    with pytest.raises(ValueError, match=match):
+        build_output(value, Meal)
+
+
+def test_the_schema_requires_every_field_and_carries_descriptions():
+    assert output_schema(Meal) == {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "The meal's name"},
+            "bounds": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {
+                        "min": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                        "max": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                    },
+                    "required": ["min", "max"],
+                    "additionalProperties": False,
+                },
+                "propertyNames": {"enum": ["kcal", "protein"]},
+            },
+            "tags": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["name", "bounds", "tags"],
+        "additionalProperties": False,
+    }
+
+
+def test_a_mapping_is_keyed_by_str_or_an_enum():
+    @dataclass
+    class Counts(Output):
+        by_size: dict[int, int]
+
+    with pytest.raises(TypeError, match="keyed by str or an Enum"):
+        output_schema(Counts)
+    with pytest.raises(TypeError, match="keyed by str or an Enum"):
+        build_output({"by_size": {}}, Counts)

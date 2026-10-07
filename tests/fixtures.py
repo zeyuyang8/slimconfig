@@ -9,7 +9,7 @@ from typing import Any
 
 from omegaconf import MISSING
 
-from slimconfig import Config, partial_of
+from slimconfig import Config, Output, partial_of
 
 
 # A base of Optim: it states a SUBSET of the fields, which is what a shared fragment does — so a file
@@ -129,6 +129,28 @@ class Report(Config):
     metrics: dict[Column, list[str]] = MISSING
     weights: dict[Column, float] = MISSING
     labels: list[str | int] = MISSING  # a union of scalars: any member will do, and nothing else
+
+
+# ── inputs ───────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class Messages(Output):
+    turns: list[str]
+
+
+@dataclass
+class Judge(Config):
+    reference: Messages = MISSING
+
+
+# A run that reads typed JSON: its YAML names a file for each input, here and inside a group and a table.
+@dataclass
+class ReplayConfig(Config):
+    prior: Messages = MISSING
+    baseline: Messages | None = MISSING
+    judge: Judge = field(default_factory=Judge)
+    per_stage: dict[Stage, Judge] = MISSING
 
 
 # ── schemas that are not well-formed ─────────────────────────────────────────

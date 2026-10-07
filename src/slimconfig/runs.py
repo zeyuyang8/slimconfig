@@ -32,6 +32,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from .config import ARROW, ROOT_NAME
 from .layouts import close_layout, describe, open_layout, parts
+from .outputs import Output, source_of
 from .schemas import Config, Schema, Shape, declaration_name
 from .structured import Spec, load_config
 
@@ -109,13 +110,29 @@ def _enum_values(node: Any) -> Any:
     return node
 
 
+# A config instance as plain data, each input field as the path its output was read from. Unset
+# fields stay `???`, as OmegaConf writes them.
+def _container(config: Any, schema: Schema) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for name, held in schema.fields.items():
+        value = getattr(config, name)
+        if isinstance(value, Output):
+            out[name] = source_of(value)
+        elif held.kind == "group" and dataclasses.is_dataclass(value):
+            out[name] = _container(value, Schema(cast(type, held.cls)))
+        elif held.kind == "table" and isinstance(value, Mapping):
+            out[name] = {k: _container(v, Schema(cast(type, held.cls))) for k, v in value.items()}
+        else:
+            out[name] = value
+    return out
+
+
 # The snapshot's YAML text; only a Config instance gets class declarations.
 def _snapshot(config: Any) -> str:
-    node = _as_dictconfig(config)
     if not isinstance(config, Config):
-        return OmegaConf.to_yaml(node, resolve=True)
-    container = _enum_values(OmegaConf.to_container(node, resolve=True))
+        return OmegaConf.to_yaml(_as_dictconfig(config), resolve=True)
     root = Schema(type(config))
+    container = _enum_values(_container(config, root))
     body = OmegaConf.to_yaml(OmegaConf.create(_stamp(cast(Mapping, container), root)))
     return f"{_declares(ROOT_NAME, type(config))}:\n{body}"
 

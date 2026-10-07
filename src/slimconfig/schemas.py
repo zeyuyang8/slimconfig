@@ -6,6 +6,8 @@
 #   a TABLE  `dict[SomeEnum, C]` for a config class C: several C, one per Enum member.
 # Every config class (root, group, table entry) subclasses `Config`, and is checked at its `class` statement.
 # A value is a str / int / float / bool / Enum, a union of those, a list or dict of any of it, or `| None`.
+# A value may also be an INPUT: a field typed with an Output class (slimconfig.outputs), which its YAML
+# fills with the path of a JSON file and the loader reads into that class (`prior: pkg.mod.Messages`).
 # A mapping is keyed by an Enum, never a bare `str`; in YAML a key is written as the member's value.
 # A YAML names the class of each mapping it fills:
 #     optim > pkg.mod.OptimConfig:             this mapping IS an OptimConfig
@@ -25,6 +27,8 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any, ClassVar, Literal, NamedTuple, Union, get_args, get_origin, get_type_hints
 
+from .outputs import Output
+
 __all__ = [
     "Config",
     "Declaration",
@@ -33,6 +37,7 @@ __all__ = [
     "Shape",
     "check_declaration",
     "declaration_name",
+    "is_input",
     "key_name",
     "optional",
     "schema_name",
@@ -148,9 +153,16 @@ def optional(annotation: Any) -> Any:
     return annotation
 
 
-# The Shape an annotation describes; `X | None` counts as whatever X is.
+# Is `annotation` an input: an output class, filled from the JSON file its YAML names?
+def is_input(annotation: Any) -> bool:
+    return isinstance(annotation, type) and dataclasses.is_dataclass(annotation) and issubclass(annotation, Output)
+
+
+# The Shape an annotation describes; `X | None` counts as whatever X is. An input is a leaf.
 def _shape_of(annotation: Any) -> Shape:
     annotation = optional(annotation)
+    if is_input(annotation):
+        return Shape("value", None)
     if dataclasses.is_dataclass(annotation) and isinstance(annotation, type):
         return Shape("group", annotation)
     if get_origin(annotation) is dict:
@@ -205,7 +217,7 @@ def _value_error(annotation: Any) -> str | None:
                 f"and {_shown(held)} is not one"
             )
         return None
-    if annotation in _SCALARS or _is_enum(annotation):
+    if annotation in _SCALARS or _is_enum(annotation) or is_input(annotation):
         return None
     if annotation is Any or annotation is object:
         return "it says nothing about the value — name the type the config actually holds"

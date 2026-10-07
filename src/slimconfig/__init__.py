@@ -15,18 +15,21 @@
 #   * where a run writes is not config: `config=` and `home=` belong to the launcher; the log is `run.log`.
 #
 # A Run may declare its folder's layout: typed outputs (`Output` classes, written as JSON) and folders,
-# created, checked and read back with `load_layout` (see slimconfig.layouts).
+# created, checked and read back with `load_layout` (see slimconfig.layouts). The same `Output` classes
+# type any JSON value (`build_output`, `plain_output`) and give its JSON Schema (`output_schema`).
+# A config field typed with an `Output` class is an input: its YAML names a JSON file, read into that
+# class and checked before main runs; the run's config.yaml names it by the same path.
 
 from .config import compose, load_mapping_yaml, load_yaml
 from .layouts import Folder, Layout, load_layout
-from .outputs import Output, load_output, write_output
+from .outputs import Output, build_output, load_output, output_schema, plain_output, write_output
 from .partials import is_partial, partial_of, stated
 from .paths import project_root, resolve_path
 from .runs import Run, run, start_run, tee_stdout
 from .schemas import Config, Schema
 from .structured import Spec, load_config, merge_specs, peek, schema_of
 
-__version__ = "0.17.0"
+__version__ = "0.18.0"
 
 # The public API; loader record types (Claim, Composed, Key) stay in slimconfig.config.
 __all__ = [
@@ -37,6 +40,7 @@ __all__ = [
     "Run",
     "Schema",
     "Spec",
+    "build_output",
     "compose",
     "is_partial",
     "load_config",
@@ -45,8 +49,10 @@ __all__ = [
     "load_output",
     "load_yaml",
     "merge_specs",
+    "output_schema",
     "partial_of",
     "peek",
+    "plain_output",
     "project_root",
     "resolve_path",
     "run",

@@ -6,21 +6,24 @@
 #   * every key a file sets is a field of the class it fills (or an Enum member, under a mapping);
 #   * every leaf ends up set (a null must be written as null, an empty collection as []);
 #   * every value is the type its field declares, all the way down (OmegaConf only checks scalars).
+# An input field (typed with an Output class) is a path in YAML and the output read from it once loaded.
 # Files are read via slimconfig.config.compose, so any mapping may carry `_default: <path>`.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterator, Mapping
 from enum import Enum
-from functools import reduce
+from functools import cache, reduce
 from pathlib import Path
-from typing import Any, cast, get_args, get_origin
+from typing import Any, Optional, cast, get_args, get_origin, get_type_hints
 
 from omegaconf import DictConfig, OmegaConf
 
 from .config import Claim, Composed, Key, compose
+from .outputs import load_output
 from .partials import is_partial
-from .schemas import Schema, declaration_name, key_name, optional, value_error
+from .schemas import Schema, Shape, declaration_name, is_input, key_name, optional, value_error
 
 # One config source: a YAML file path, a `dotted.key=value` override, or a ready-made mapping.
 type Spec = str | Mapping[str, Any] | DictConfig
@@ -71,17 +74,67 @@ def _wrong_values(cfg: DictConfig, schema: Schema, prefix: str = "") -> list[str
 # leaves a partial may leave unset; here an unset field is just not passed.
 def _instantiate[T](node: DictConfig, schema: type[T]) -> T:
     kwargs: dict[str, Any] = {}
+    hints = get_type_hints(schema)
     for name, held in Schema(cast(type, schema)).fields.items():
         if OmegaConf.is_missing(node, name):
             continue
         value = node[name]
-        if held.cls is None or value is None:
+        if is_input(optional(hints[name])) and value is not None:
+            kwargs[name] = _read_input(value, optional(hints[name]), f"{schema.__name__}.{name}")
+        elif held.cls is None or value is None:
             kwargs[name] = OmegaConf.to_object(value) if OmegaConf.is_config(value) else value
         elif held.kind == "group":
             kwargs[name] = _instantiate(cast(DictConfig, value), held.cls)
         else:
             kwargs[name] = {key: _instantiate(value[key], held.cls) for key in value}
     return schema(**kwargs)
+
+
+# Read the input field `where` from the JSON file `path`, naming the field in any error.
+def _read_input(path: str, cls: type, where: str) -> Any:
+    try:
+        return load_output(path, cls)
+    except (OSError, ValueError) as e:
+        raise ValueError(f"{where} reads {path!r}: {e}") from e
+
+
+# `cls` as OmegaConf holds it: every input field, all the way down, is the str path of its file. A class
+# with no input anywhere is its own.
+@cache
+def _held(cls: type) -> type:
+    hints, shapes = get_type_hints(cls), Schema(cls).fields
+    fields = dataclasses.fields(cls)
+    types = {f.name: _held_type(hints[f.name], shapes[f.name]) for f in fields}
+    if all(types[f.name] is hints[f.name] for f in fields):
+        return cls
+    specs: list[Any] = []
+    for f in fields:
+        if f.default_factory is not dataclasses.MISSING:
+            factory = f.default_factory
+            if isinstance(factory, type) and dataclasses.is_dataclass(factory):
+                factory = _held(factory)
+            specs.append((f.name, types[f.name], dataclasses.field(default_factory=factory)))
+        elif f.default is not dataclasses.MISSING:
+            specs.append((f.name, types[f.name], dataclasses.field(default=f.default)))
+        else:
+            specs.append((f.name, types[f.name]))
+    return dataclasses.make_dataclass(cls.__name__, specs)
+
+
+# A field's annotation as OmegaConf holds it (see `_held`); the annotation itself if nothing changes.
+def _held_type(annotation: Any, shape: Shape) -> Any:
+    inner = optional(annotation)
+    if is_input(inner):
+        held: Any = str
+    elif shape.kind == "group":
+        held = _held(cast(type, shape.cls))
+    elif shape.kind == "table":
+        held = dict[shape.key, _held(cast(type, shape.cls))]
+    else:
+        return annotation
+    if held == inner:
+        return annotation
+    return held if inner is annotation else Optional[held]  # noqa: UP045 — OmegaConf reads Optional
 
 
 # Compose one spec: a file through the YAML layer, an override or mapping as-is.
@@ -236,7 +289,7 @@ def load_config[T](schema: type[T], specs: list[Spec]) -> T:
     _check_declared(root, composed.keys, composed.claims)
     _check_keys(root, composed.keys)
     named = OmegaConf.create(_enum_words(OmegaConf.to_container(composed.config, resolve=False), root))
-    merged = cast(DictConfig, OmegaConf.merge(OmegaConf.structured(schema), named))
+    merged = cast(DictConfig, OmegaConf.merge(OmegaConf.structured(_held(cast(type, schema))), named))
     missing = _missing_fields(merged, root)
     if missing:
         raise ValueError(f"{root.cls.__name__} is missing required field(s): {', '.join(missing)}")
