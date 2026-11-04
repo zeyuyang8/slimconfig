@@ -165,3 +165,74 @@ def test_a_mapping_is_keyed_by_str_or_an_enum():
         output_schema(Counts)
     with pytest.raises(TypeError, match="keyed by str or an Enum"):
         build_output({"by_size": {}}, Counts)
+
+
+# ── unions of output classes ─────────────────────────────────────────────────
+
+
+@dataclass
+class Passed(Output):
+    seconds: float
+
+
+@dataclass
+class Failed(Output):
+    error: str
+
+
+@dataclass
+class Result(Output):
+    outcome: Passed | Failed
+    retried: list[Passed | Failed]
+    last: Passed | Failed | None
+
+
+def test_a_union_of_output_classes_is_written_tagged_by_its_class_and_read_back(tmp_path):
+    result = Result(Failed("boom"), [Passed(1.0), Failed("x")], None)
+    path = write_output(str(tmp_path / "out.json"), result)
+    data = json.loads(Path(path).read_text())
+    assert data["outcome"] == {"Failed": {"error": "boom"}}
+    assert data["retried"] == [{"Passed": {"seconds": 1.0}}, {"Failed": {"error": "x"}}]
+    assert data["last"] is None
+    assert load_output(path, Result) == result
+    assert type(load_output(path, Result).outcome) is Failed
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [{"error": "boom"}, {"Skipped": {}}, {"Passed": {"seconds": 1.0}, "Failed": {"error": "x"}}, None],
+)
+def test_a_union_value_names_exactly_one_of_its_classes(outcome):
+    with pytest.raises(ValueError, match=r"Result.outcome is not one of Passed, Failed"):
+        build_output({"outcome": outcome, "retried": [], "last": None}, Result)
+
+
+def test_a_union_value_is_checked_as_its_class():
+    with pytest.raises(ValueError, match=r"Result.outcome.Failed is missing field\(s\): error"):
+        build_output({"outcome": {"Failed": {}}, "retried": [], "last": None}, Result)
+
+
+def test_a_value_of_no_class_of_its_union_is_not_written():
+    with pytest.raises(TypeError, match="Result.outcome holds a Step, none of the union"):
+        plain_output(Result(Step("a", 1), [], None))  # type: ignore[arg-type]
+
+
+def test_a_union_of_output_classes_is_one_of_their_tagged_schemas():
+    schema = output_schema(Result)["properties"]
+    assert schema["outcome"] == {
+        "oneOf": [
+            {"type": "object", "properties": {"Passed": output_schema(Passed)}, "required": ["Passed"], "additionalProperties": False},
+            {"type": "object", "properties": {"Failed": output_schema(Failed)}, "required": ["Failed"], "additionalProperties": False},
+        ]
+    }
+    assert schema["last"]["anyOf"][1] == {"type": "null"}
+
+
+def test_a_union_of_two_classes_of_one_name_or_of_scalars_is_refused():
+    Other = type("Passed", (Output,), {"__annotations__": {"n": int}})
+    Two = dataclass(type("Two", (Output,), {"__annotations__": {"x": Passed | dataclass(Other)}}))
+    with pytest.raises(TypeError, match="two classes of one name"):
+        output_schema(Two)
+    Scalars = dataclass(type("Scalars", (Output,), {"__annotations__": {"x": int | str}}))
+    with pytest.raises(TypeError, match="union of output classes, not the union"):
+        output_schema(Scalars)

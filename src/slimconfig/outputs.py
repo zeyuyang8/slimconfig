@@ -9,8 +9,24 @@
 #
 # An output class is a @dataclass subclassing `Output`. Its fields may be str, int, float, bool, None,
 # an Enum (written as its value), a nested output class, `list[T]`, `dict[K, T]` (K is str or an Enum,
-# a key written as its value), `T | None`, or `Any` (any JSON value, passed through unchecked). Every
-# field is required. `Annotated[T, "text"]` is a T that `output_schema` describes as "text".
+# a key written as its value), `T | None`, a union of output classes, or `Any` (any JSON value, passed
+# through unchecked). Every field is required. `Annotated[T, "text"]` is a T that `output_schema`
+# describes as "text".
+#
+# A union of output classes, `A | B` (or `A | B | None`), holds an instance of one of them, so its
+# classes have distinct names; it is written tagged by its class's name, a mapping of that one key:
+#
+#     @dataclass
+#     class Passed(Output):
+#         seconds: float
+#
+#     @dataclass
+#     class Failed(Output):
+#         error: str
+#
+#     @dataclass
+#     class Result(Output):
+#         outcome: Passed | Failed    # {"outcome": {"Failed": {"error": "..."}}}
 #
 # The same classes type any JSON value, not only a file: `build_output` checks one into its class,
 # `plain_output` turns one back into JSON, and `output_schema` is the class as a JSON Schema.
@@ -79,10 +95,11 @@ def build_output[T](value: Any, cls: type[T]) -> T:
     return _build(value, cls, cls.__name__)
 
 
-# `output` as a JSON value: a mapping of its fields, Enums as their values.
+# `output` as a JSON value: a mapping of its fields, Enums as their values, each value of a union of
+# output classes tagged by its class's name.
 def plain_output(output: Output) -> dict[str, Any]:
     output_class(type(output).__qualname__, "type", type(output))
-    return _plain(dataclasses.asdict(output))
+    return _dump(output, type(output), type(output).__name__)
 
 
 # The JSON Schema every value `build_output` accepts into `cls` matches.
@@ -91,7 +108,52 @@ def output_schema(cls: type) -> dict[str, Any]:
     return _schema(cls, cls.__name__)
 
 
+# `value`, of type `ann`, as JSON; `where` names it in errors.
+def _dump(value: Any, ann: Any, where: str) -> Any:
+    if get_origin(ann) is Annotated:
+        ann = get_args(ann)[0]
+    origin, args = get_origin(ann), get_args(ann)
+    if value is None or ann is Any:
+        return _plain(value)
+    if origin in (Union, types.UnionType):
+        classes = _tagged(ann, where)
+        if classes is None:
+            return _dump(value, next(a for a in args if a is not type(None)), where)
+        name = type(value).__name__
+        if classes.get(name) is not type(value):
+            raise TypeError(f"{where} holds a {name}, none of the union {ann}")
+        return {name: _dump(value, type(value), f"{where}.{name}")}
+    if isinstance(ann, type) and dataclasses.is_dataclass(ann):
+        hints = get_type_hints(type(value))
+        return {
+            f.name: _dump(getattr(value, f.name), hints[f.name], f"{where}.{f.name}")
+            for f in dataclasses.fields(value)
+        }
+    if origin is list:
+        return [_dump(v, args[0], f"{where}[{i}]") for i, v in enumerate(value)]
+    if origin is dict:
+        return {_plain(k): _dump(v, args[1], f"{where}[{k}]") for k, v in value.items()}
+    return _plain(value)
+
+
+# The classes of a union of output classes, by name; None for `T | None`, which holds one type.
+def _tagged(ann: Any, where: str) -> dict[str, type] | None:
+    options = [a for a in get_args(ann) if a is not type(None)]
+    if len(options) == 1:
+        return None
+    if not all(isinstance(a, type) and dataclasses.is_dataclass(a) for a in options):
+        raise TypeError(
+            f"{where}: an output field may be `T | None` or a union of output classes, not the union {ann}"
+        )
+    classes = {a.__name__: a for a in options}
+    if len(classes) != len(options):
+        raise TypeError(f"{where}: the union {ann} holds two classes of one name, so its tag cannot tell them")
+    return classes
+
+
 def _plain(node: Any) -> Any:
+    if dataclasses.is_dataclass(node) and not isinstance(node, type):  # one in an `Any` field
+        return _plain(dataclasses.asdict(node))
     if isinstance(node, enum.Enum):
         return node.value
     if isinstance(node, dict):
@@ -118,12 +180,17 @@ def _build(value: Any, ann: Any, where: str) -> Any:
     if ann is Any:
         return value
     if origin in (Union, types.UnionType):
-        options = [a for a in args if a is not type(None)]
-        if value is None and len(options) < len(args):
+        if value is None and type(None) in args:
             return None
-        if len(options) != 1:
-            raise TypeError(f"{where}: an output field may be `T | None`, not the union {ann}")
-        return _build(value, options[0], where)
+        classes = _tagged(ann, where)
+        if classes is None:
+            return _build(value, next(a for a in args if a is not type(None)), where)
+        if not (isinstance(value, dict) and len(value) == 1 and next(iter(value)) in classes):
+            raise ValueError(
+                f"{where} is not one of {', '.join(classes)}, a mapping of its class's name: {value!r}"
+            )
+        [(name, held)] = value.items()
+        return _build(held, classes[name], f"{where}.{name}")
     if isinstance(ann, type) and dataclasses.is_dataclass(ann):
         if not isinstance(value, dict):
             raise ValueError(f"{where} is not a {ann.__name__} mapping: {value!r}")
@@ -176,10 +243,21 @@ def _schema(ann: Any, where: str) -> dict[str, Any]:
     if ann is Any:
         return {}
     if origin in (Union, types.UnionType):
-        options = [a for a in args if a is not type(None)]
-        if len(options) != 1:
-            raise TypeError(f"{where}: an output field may be `T | None`, not the union {ann}")
-        return {"anyOf": [_schema(options[0], where), {"type": "null"}]}
+        classes = _tagged(ann, where)
+        if classes is None:
+            return {"anyOf": [_schema(next(a for a in args if a is not type(None)), where), {"type": "null"}]}
+        one = {
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {name: _schema(cls, f"{where}.{name}")},
+                    "required": [name],
+                    "additionalProperties": False,
+                }
+                for name, cls in classes.items()
+            ]
+        }
+        return {"anyOf": [one, {"type": "null"}]} if type(None) in args else one
     if isinstance(ann, type) and dataclasses.is_dataclass(ann):
         hints = get_type_hints(ann, include_extras=True)
         names = [f.name for f in dataclasses.fields(ann)]
