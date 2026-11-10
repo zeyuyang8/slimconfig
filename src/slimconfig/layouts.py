@@ -208,16 +208,21 @@ def _parses(text: str) -> bool:
 
 
 # Read the record `text` back as `cls`, an output class or a config class (whose fields `load_config`
-# reads), or as the output class its `_` names when `cls` is None; raises a ValueError naming `where`.
+# reads), or as the output or config class its `_` names when `cls` is None; raises a ValueError naming
+# `where`.
 def _read_back(text: str, cls: type | None, where: str) -> None:
     if cls is None:
         value = json.loads(text)
         found = value.get(ROOT_NAME) if isinstance(value, dict) else None
         cls = _import_dotted(found) if isinstance(found, str) else None
-        if not (isinstance(cls, type) and dataclasses.is_dataclass(cls) and issubclass(cls, Output)):
-            named = f'no class under "{ROOT_NAME}"' if found is None else f'{found!r} under "{ROOT_NAME}", no output class'
+        if not (isinstance(cls, type) and dataclasses.is_dataclass(cls) and issubclass(cls, (Output, Config))):
+            named = f'no class under "{ROOT_NAME}"' if found is None else f'{found!r} under "{ROOT_NAME}", no output or config class'
             raise ValueError(f"{where} is JSON that names {named}, so it is no record")
     if issubclass(cls, Config):
-        load_config(cls, [record_fields(text, cls, where)])
+        fields = record_fields(text, cls, where)
+        try:
+            load_config(cls, [fields])
+        except ValueError as e:
+            raise ValueError(f"{where}: {e}") from None
     else:
         read_record(text, cls, where)

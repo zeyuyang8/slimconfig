@@ -45,7 +45,7 @@ from .runs import Metadata, Run, run, start_run, tee_stdout
 from .schemas import Config, Schema
 from .structured import Spec, load_config, merge_specs, peek, schema_of
 
-__version__ = "0.20.0"
+__version__ = "0.20.1"
 
 # The public API; loader record types (Claim, Composed, Key) stay in slimconfig.config.
 __all__ = [

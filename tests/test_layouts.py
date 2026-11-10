@@ -162,8 +162,15 @@ def test_a_folder_may_hold_records_each_read_back_as_the_class_it_names(tmp_path
 def test_a_record_naming_its_class_over_fields_that_are_not_its_fails_the_run(tmp_path, monkeypatch, write):
     with pytest.raises(RuntimeError, match=r"/run/harness/x.json: Messages has key\(s\) Messages does not declare: words"):
         tooled(monkeypatch, tmp_path, write, {"harness/x.json": '{"_": "test_layouts.Messages", "words": 1}'})
-    with pytest.raises(RuntimeError, match=r"""harness/y.json is JSON that names 'os.path' under "_", no output class"""):
+    with pytest.raises(RuntimeError, match=r"""harness/y.json is JSON that names 'os.path' under "_", no output or config class"""):
         tooled(monkeypatch, tmp_path, write, {"harness/y.json": '{"_": "os.path"}'})
+
+
+def test_a_record_naming_a_config_class_reads_back_as_that_config(tmp_path, monkeypatch, write):
+    good = '{"_": "fixtures.LrOnly", "lr": 0.1}'
+    assert tooled(monkeypatch, tmp_path, write, {"harness/input.json": good}) is None
+    with pytest.raises(RuntimeError, match=r"harness/input.json"):
+        tooled(monkeypatch, tmp_path, write, {"harness/input.json": '{"_": "fixtures.LrOnly", "lr": "fast"}'})
 
 
 def test_a_file_the_run_reads_as_its_class_must_read_back_whole(tmp_path, monkeypatch, write):
