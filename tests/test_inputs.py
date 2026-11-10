@@ -26,7 +26,7 @@ per_stage > dict[fixtures.Stage, fixtures.Judge]:
 
 def messages(tmp_path, value) -> str:
     path = tmp_path / "prior.json"
-    path.write_text(json.dumps(value), encoding="utf-8")
+    path.write_text(json.dumps({"_": "fixtures.Messages", **value}), encoding="utf-8")
     return str(path)
 
 
@@ -53,6 +53,13 @@ def test_an_input_file_is_checked_against_its_class(tmp_path, write):
     prior = messages(tmp_path, {"turns": "hi"})
     with pytest.raises(ValueError, match=r"ReplayConfig.prior reads .*prior.json.*Messages.turns is not a list"):
         load_config(fixtures.ReplayConfig, [replay(tmp_path, write, prior)])
+
+
+def test_an_input_file_names_its_class(tmp_path, write):
+    prior = tmp_path / "prior.json"
+    prior.write_text(json.dumps({"turns": []}), encoding="utf-8")
+    with pytest.raises(ValueError, match=r'ReplayConfig.prior reads .*prior.json.* names no class under "_"'):
+        load_config(fixtures.ReplayConfig, [replay(tmp_path, write, str(prior))])
 
 
 def test_a_missing_input_file_names_the_field(tmp_path, write):

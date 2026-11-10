@@ -28,8 +28,23 @@
 #     class Result(Output):
 #         outcome: Passed | Failed    # {"outcome": {"Failed": {"error": "..."}}}
 #
-# The same classes type any JSON value, not only a file: `build_output` checks one into its class,
-# `plain_output` turns one back into JSON, and `output_schema` is the class as a JSON Schema.
+# An output is kept as a RECORD, a JSON file or one line of a JSON-lines file, which names its class at
+# its top level under the reserved key `_`, by its dotted path, as a config file does on its
+# `_ > pkg.mod.Class:` line:
+#
+#     {"_": "pkg.mod.Score", "accuracy": 0.5, "per_class": {"cat": 1.0}}
+#
+#   * write_output / load_output  — a record's file: `write_output(path, score)`, `load_output(path, Score)`.
+#   * record_text  / record_line  — a record as a file's text (indented) or one line (compact), each
+#                                   ending in a newline; `read_record(text, Score, where)` reads either back,
+#                                   `record_fields(text, cls, where)` only its fields (a config's record).
+# Reading a record fails, naming it, unless its `_` names exactly the class it is read as. Only the top
+# level is named: a value inside a record has its class from its field's type. A run folder holds JSON
+# only as records (see slimconfig.layouts.unrecorded).
+#
+# The same classes type any JSON VALUE, untagged (a model's reply, a value inside a record):
+# `build_output` checks one into its class, `plain_output` turns one back into JSON, and
+# `output_schema` is the class as a JSON Schema.
 
 from __future__ import annotations
 
@@ -39,7 +54,21 @@ import json
 import types
 from typing import Annotated, Any, Union, get_args, get_origin, get_type_hints
 
-__all__ = ["Output", "build_output", "load_output", "output_schema", "plain_output", "write_output"]
+from .config import ROOT_NAME
+from .names import schema_name
+
+__all__ = [
+    "Output",
+    "build_output",
+    "load_output",
+    "output_schema",
+    "plain_output",
+    "read_record",
+    "record_fields",
+    "record_line",
+    "record_text",
+    "write_output",
+]
 
 
 class Output:
@@ -56,23 +85,60 @@ def output_class(owner: str, where: str, cls: Any) -> type:
     return cls
 
 
-# Write `output` to the JSON file `path`, Enums as their values; returns the path.
+# Write `output` to the JSON file `path` as its record (`record_text`); returns the path.
 def write_output(path: str, output: Output) -> str:
-    plain = plain_output(output)
+    text = record_text(output)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(plain, f, indent=2)
-        f.write("\n")
+        f.write(text)
     return path
 
 
-# Read the JSON file `path` back into `cls`, checking every value against its field's type. The output
-# remembers `path` (see `source_of`).
+# Read the record in the JSON file `path` back into `cls` (`read_record`). The output remembers `path`
+# (see `source_of`).
 def load_output[T](path: str, cls: type[T]) -> T:
     output_class(cls.__qualname__, "type", cls)
     with open(path, encoding="utf-8") as f:
-        output = build_output(json.load(f), cls)
+        output = read_record(f.read(), cls, path)
     object.__setattr__(output, _SOURCE, path)  # Output has no __slots__, so even a frozen one takes it
     return output
+
+
+# `output` as a JSON file's text: its record, indented, ending in a newline.
+def record_text(output: Output) -> str:
+    return json.dumps(_record(output), indent=2, allow_nan=False) + "\n"
+
+
+# `output` as one line of a JSON-lines file: its record, compact, ending in a newline.
+def record_line(output: Output) -> str:
+    return json.dumps(_record(output), allow_nan=False) + "\n"
+
+
+# Read a record's text (a JSON file's, or one line of a JSON-lines file) back into `cls`: its `_` must
+# name `cls`, and every other key is checked as `build_output` checks it. `where` names the record in
+# errors: its path, or its path and line.
+def read_record[T](text: str, cls: type[T], where: str) -> T:
+    output_class(cls.__qualname__, "type", cls)
+    fields = record_fields(text, cls, where)
+    try:
+        return build_output(fields, cls)
+    except ValueError as e:
+        raise ValueError(f"{where}: {e}") from None
+
+
+# The fields of the record `text` holds, unchecked: its `_` must name `cls`, an output class or a config
+# class (a config record, such as a JSON file `load_config` reads), as `read_record` requires.
+def record_fields(text: str, cls: type, where: str) -> dict[str, Any]:
+    value, expected = json.loads(text), schema_name(cls)
+    found = value.get(ROOT_NAME) if isinstance(value, dict) else None
+    if found != expected:
+        named = "no class" if found is None else repr(found)
+        raise ValueError(f'{where} names {named} under "{ROOT_NAME}", but is read as a {expected} record')
+    return {k: v for k, v in value.items() if k != ROOT_NAME}
+
+
+# `output`'s record: its class's dotted path under `_`, then its fields (`plain_output`).
+def _record(output: Output) -> dict[str, Any]:
+    return {ROOT_NAME: schema_name(type(output)), **plain_output(output)}
 
 
 _SOURCE = "__slimconfig_source__"

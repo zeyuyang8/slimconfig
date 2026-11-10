@@ -27,6 +27,7 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any, ClassVar, Literal, NamedTuple, Union, get_args, get_origin, get_type_hints
 
+from .names import main_names, schema_name
 from .outputs import Output
 
 __all__ = [
@@ -80,17 +81,8 @@ class Declaration(NamedTuple):
     key: type | None  # the type a table's keys have; None for a group
 
 
-# The names the launched script goes by. A class defined there lives in `__main__`, and re-importing the
-# script under its real name would run it again and yield a different class, so the two are treated as one.
-def _main_names() -> tuple[str, ...]:
-    main = sys.modules.get("__main__")
-    spec = getattr(main, "__spec__", None)  # set by `python -m pkg.mod`
-    file = getattr(main, "__file__", None)  # set by `python path/to/train.py`
-    return tuple(n for n in (getattr(spec, "name", None), Path(file).stem if file else None) if n)
-
-
 def _import_module(name: str) -> Any:
-    if name in _main_names():
+    if name in main_names():
         return sys.modules["__main__"]
     return importlib.import_module(name)
 
@@ -113,14 +105,6 @@ def _import_dotted(dotted: str) -> Any:
         if obj is not None:
             return obj
     return None
-
-
-# The dotted path a YAML names `cls` by — the inverse of `Schema.resolve`.
-def schema_name(cls: type) -> str:
-    module = cls.__module__
-    if module == "__main__":
-        module = next(iter(_main_names()), module)
-    return f"{module}.{cls.__qualname__}"
 
 
 # How a YAML declares `cls`: its dotted path for a group, `dict[K, path]` for a table of them.

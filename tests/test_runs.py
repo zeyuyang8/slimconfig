@@ -13,7 +13,7 @@ import fixtures
 import pytest
 from omegaconf import OmegaConf
 
-from slimconfig import Config, Run, load_config, run, start_run, tee_stdout
+from slimconfig import Config, Metadata, Run, load_config, load_output, run, start_run, tee_stdout
 
 FULL = """
 model: llama
@@ -35,9 +35,19 @@ def test_start_run_writes_a_resolved_snapshot_and_meta(tmp_path, write):
     run_dir = start_run(str(tmp_path / "runs" / "demo"), cfg)
     snapshot = OmegaConf.load(f"{run_dir}/config.yaml")
     assert snapshot.model == "llama"
-    meta = json.loads((tmp_path / "runs" / "demo" / "metadata.json").read_text())
-    assert {"argv", "cwd", "run_dir", "started", "host"} <= meta.keys()
-    assert meta["run_dir"] == str(tmp_path / "runs" / "demo")
+    meta = load_output(str(tmp_path / "runs" / "demo" / "metadata.json"), Metadata)
+    assert meta.run_dir == str(tmp_path / "runs" / "demo")
+    assert meta.layout is None
+
+
+def test_metadata_is_a_record_naming_its_class(tmp_path, write, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # outside any git checkout: its git fields are null, never left out
+    cfg = load_config(fixtures.TrainConfig, [write(tmp_path / "a.yaml", FULL)])
+    start_run(str(tmp_path / "run"), cfg)
+    meta = json.loads((tmp_path / "run" / "metadata.json").read_text())
+    assert meta["_"] == "slimconfig.runs.Metadata"
+    assert meta["git_commit"] is None
+    assert meta["git_dirty"] is None
 
 
 def test_the_snapshot_names_the_class_so_it_is_a_config_like_any_other(tmp_path, write):
@@ -420,3 +430,11 @@ def test_run_rejects_a_second_argument_that_is_not_the_run_folder():
 
     with pytest.raises(TypeError, match="is the run folder and must be annotated"):
         run(train)
+
+
+def test_a_run_with_no_layout_fails_on_json_in_its_folder_that_names_no_class(tmp_path, monkeypatch, write):
+    def train(cfg: fixtures.TrainConfig, run_dir: str) -> None:
+        Path(run_dir, "results.json").write_text('{"loss": 0.5}')
+
+    with pytest.raises(RuntimeError, match=r'results.json is JSON that names no class under "_", so it is no record'):
+        launch(monkeypatch, [f"config={write(tmp_path / 'a.yaml', FULL)}", f"home={tmp_path / 'run'}"], train)

@@ -14,7 +14,8 @@ from typing import Any, get_type_hints
 
 from omegaconf import MISSING
 
-from .schemas import Schema, schema_name
+from .names import schema_name
+from .schemas import Schema
 
 __all__ = ["is_partial", "partial_of", "stated"]
 

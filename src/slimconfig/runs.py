@@ -1,7 +1,8 @@
 # The run layer: one folder per run, holding its config, its log and its results.
 #   * run        — the launcher: a script's whole __main__.
 #   * Run        — the class form of `run`, for a routine that is several methods sharing state.
-#   * start_run  — the snapshot alone (config.yaml + metadata.json), for a routine opening its own folder.
+#   * start_run  — the snapshot alone (config.yaml + metadata.json, a `Metadata` record), for a routine
+#                  opening its own folder.
 #   * tee_stdout — the log alone.
 # A launch, the same on the command line and in the script:
 #     python train.py config=configs/train.yaml home=runs/exp1 -- optim.lr=1e-4
@@ -10,7 +11,10 @@
 #
 # A Run may also declare its folder's contents (see slimconfig.layouts): `layout: ChatLayout`. Its main
 # then finds the layout's folders created and sets its outputs; the run writes them, records the layout
-# in metadata.json, and fails on anything in the folder the layout does not declare.
+# in metadata.json, and fails on anything in the folder the layout does not declare. Every JSON file a
+# run writes is a record naming its class (see slimconfig.outputs); `load_output(path, Metadata)` reads
+# metadata.json back. Once main returns, a run of any kind fails on JSON in its folder that is no
+# record, read back as its class, or on a symlink there (`recorded`); a Workspace's files are not read.
 
 from __future__ import annotations
 
@@ -19,7 +23,6 @@ import contextlib
 import dataclasses
 import enum
 import inspect
-import json
 import os
 import socket
 import subprocess
@@ -31,12 +34,12 @@ from typing import Any, NoReturn, cast, get_type_hints
 from omegaconf import DictConfig, OmegaConf
 
 from .config import ARROW, ROOT_NAME
-from .layouts import close_layout, describe, open_layout, parts
-from .outputs import Output, source_of
+from .layouts import close_layout, describe, entry, open_layout, parts, unrecorded
+from .outputs import Output, record_text, source_of
 from .schemas import Config, Schema, Shape, declaration_name
 from .structured import Spec, load_config
 
-__all__ = ["Run", "run", "start_run", "tee_stdout"]
+__all__ = ["Metadata", "Run", "run", "start_run", "tee_stdout"]
 
 # The launcher's keys on the command line, and the log every run folder holds.
 CONFIG_KEY = "config"
@@ -53,17 +56,29 @@ def _git(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], capture_output=True, text=True, timeout=10, check=False)
 
 
-def _git_head() -> dict[str, Any]:
+# The commit the working directory is at and whether it has changes; (None, None) outside a git checkout.
+def _git_head() -> tuple[str | None, bool | None]:
     try:
         commit = _git("rev-parse", "HEAD")
         if commit.returncode:
-            return {}
-        return {
-            "git_commit": commit.stdout.strip(),
-            "git_dirty": bool(_git("status", "--porcelain").stdout.strip()),
-        }
+            return None, None
+        return commit.stdout.strip(), bool(_git("status", "--porcelain").stdout.strip())
     except (OSError, subprocess.SubprocessError):
-        return {}
+        return None, None
+
+
+@dataclasses.dataclass
+class Metadata(Output):
+    """How a run was launched: its metadata.json."""
+
+    argv: list[str]
+    cwd: str
+    run_dir: str
+    started: str  # ISO 8601, UTC, to the second
+    host: str
+    git_commit: str | None  # None outside a git checkout
+    git_dirty: bool | None
+    layout: dict[str, str] | None  # entry name -> "folder", "workspace" or its output class's name; None without one
 
 
 # The config to snapshot (a schema instance, dataclass, DictConfig or mapping) as a DictConfig.
@@ -137,23 +152,26 @@ def _snapshot(config: Any) -> str:
     return f"{_declares(ROOT_NAME, type(config))}:\n{body}"
 
 
-# Create `run_dir` and write config.yaml (resolved, re-runnable) and metadata.json (argv, cwd, git,
-# time, host). The folder must be creatable; the snapshot is best-effort and never aborts a run.
+# Create `run_dir` and write config.yaml (resolved, re-runnable) and metadata.json (a `Metadata`
+# record: argv, cwd, git, time, host, layout). The folder must be creatable; the snapshot is
+# best-effort and never aborts a run.
 def start_run(run_dir: str, config: Any, layout: type | None = None) -> str:
     os.makedirs(run_dir, exist_ok=True)
     try:
         # Render both payloads before opening a file: re-running from a snapshot passes the very
         # config.yaml about to be overwritten.
         snapshot = _snapshot(config)
-        meta = json.dumps({
-            "argv": sys.argv,
-            "cwd": os.getcwd(),
-            "run_dir": os.path.abspath(run_dir),
-            "started": datetime.now(UTC).isoformat(timespec="seconds"),
-            "host": socket.gethostname(),
-            **_git_head(),
-            **({} if layout is None else {"layout": describe(layout)}),
-        }, indent=2, sort_keys=True)
+        commit, dirty = _git_head()
+        meta = record_text(Metadata(
+            argv=list(sys.argv),
+            cwd=os.getcwd(),
+            run_dir=os.path.abspath(run_dir),
+            started=datetime.now(UTC).isoformat(timespec="seconds"),
+            host=socket.gethostname(),
+            git_commit=commit,
+            git_dirty=dirty,
+            layout=None if layout is None else describe(layout),
+        ))
         with open(os.path.join(run_dir, "config.yaml"), "w", encoding="utf-8") as f:
             f.write(snapshot)
         with open(os.path.join(run_dir, "metadata.json"), "w", encoding="utf-8") as f:
@@ -368,4 +386,19 @@ def _launch(
     banner = f"═══ {datetime.now(UTC).isoformat(timespec='seconds')} · {' '.join(sys.argv)} ═══"
     with tee_stdout(os.path.join(where, LOG), banner=banner):
         status = call(cfg, where)
+        recorded(where, layout)
     raise SystemExit(status)
+
+
+# Raise unless every JSON file in the run folder `run_dir` of `layout` (None: a run with none) is a record
+# that reads back as its class (`unrecorded`): metadata.json a Metadata, each output its class.
+def recorded(run_dir: str, layout: type | None) -> None:
+    named = {"metadata.json": (Metadata, False)}
+    workspaces = []
+    for name, (kind, cls) in ({} if layout is None else parts(layout.__qualname__, layout)).items():
+        if kind == "output":
+            named[entry(name, kind)] = (cls, False)
+        elif kind == "workspace":
+            workspaces.append(name)
+    if problems := unrecorded(run_dir, named.get, workspaces):
+        raise RuntimeError(f"{run_dir} holds JSON that is no record of its class: {'; '.join(problems)}")

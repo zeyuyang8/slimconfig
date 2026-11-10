@@ -10,7 +10,17 @@ from typing import Annotated, Any
 
 import pytest
 
-from slimconfig import Output, build_output, load_output, output_schema, plain_output, write_output
+from slimconfig import (
+    Output,
+    build_output,
+    load_output,
+    output_schema,
+    plain_output,
+    read_record,
+    record_line,
+    record_text,
+    write_output,
+)
 
 
 class Grade(enum.Enum):
@@ -47,8 +57,44 @@ def test_an_output_round_trips_through_its_file(tmp_path):
     assert load_output(str(tmp_path / "out.json"), Score) == score()
 
 
+def test_a_record_names_its_class_at_its_top_level_alone(tmp_path):
+    path = write_output(str(tmp_path / "out.json"), score())
+    data = json.loads(Path(path).read_text())
+    assert next(iter(data.items())) == ("_", "test_outputs.Score")  # first, as a config file's `_ >` line
+    assert data["steps"] == [{"name": "a", "tokens": 3}]  # a nested value's class is its field's type
+    assert Path(path).read_text() == record_text(score())
+
+
+def test_a_record_without_its_class_is_refused(tmp_path):
+    data = json.loads(record_text(score()))
+    del data["_"]
+    (tmp_path / "out.json").write_text(json.dumps(data))
+    with pytest.raises(ValueError, match=r'out.json names no class under "_", but is read as a test_outputs.Score record'):
+        load_output(str(tmp_path / "out.json"), Score)
+
+
+def test_a_record_of_another_class_is_refused(tmp_path):
+    path = write_output(str(tmp_path / "out.json"), Step("a", 3))
+    with pytest.raises(ValueError, match=r"out.json names 'test_outputs.Step' under \"_\", but is read as a test_outputs.Score record"):
+        load_output(path, Score)
+
+
+def test_a_record_is_one_line_of_a_json_lines_file():
+    text = "".join(record_line(s) for s in [Step("a", 1), Step("b", 2)])
+    assert text == '{"_": "test_outputs.Step", "name": "a", "tokens": 1}\n{"_": "test_outputs.Step", "name": "b", "tokens": 2}\n'
+    lines = text.splitlines()
+    assert [read_record(line, Step, f"steps.jsonl line {n}") for n, line in enumerate(lines, 1)] == [Step("a", 1), Step("b", 2)]
+    with pytest.raises(ValueError, match=r'steps.jsonl line 1 names no class under "_", but is read as a test_outputs.Step record'):
+        read_record(json.dumps(plain_output(Step("a", 1))), Step, "steps.jsonl line 1")
+
+
+def test_a_record_is_valid_json():
+    with pytest.raises(ValueError, match="not JSON compliant"):
+        record_line(Bound(float("nan"), None))
+
+
 def test_an_int_loads_into_a_float_field(tmp_path):
-    data = {"accuracy": 1, "grade": "fail", "steps": [], "per_class": {}, "note": "n", "extra": None}
+    data = {"_": "test_outputs.Score", "accuracy": 1, "grade": "fail", "steps": [], "per_class": {}, "note": "n", "extra": None}
     (tmp_path / "out.json").write_text(json.dumps(data))
     assert load_output(str(tmp_path / "out.json"), Score).accuracy == 1.0
 
